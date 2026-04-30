@@ -2,12 +2,17 @@ import { Injectable } from '@angular/core';
 
 export interface AiCommandContext {
   currentLLMModel: string;
-  ollamaApiHost: string;
+  apiBaseUrl: string;
+  apiKey: string;
+  availableModels: string[];
   setCurrentLLMModel: (model: string) => void;
-  setOllamaApiHost: (host: string) => void;
+  setApiBaseUrl: (host: string) => string;
+  setAvailableModels: (models: string[]) => void;
+  loadModels: () => Promise<string[]>;
+  saveSettings: () => void;
   clearChatHistory: () => void;
-  testOllamaConnection: () => void;
-  retryOllamaConnection: () => Promise<void>;
+  testOpenAiConnection: () => void;
+  retryOpenAiConnection: () => Promise<void>;
 }
 
 @Injectable({
@@ -26,32 +31,31 @@ Available commands:
 /models - List available models
 /model [name] - Show current model or switch to a different model
 /host [url] - Show current API host or set a new one
-/retry - Retry connection to Ollama API
+/retry - Retry connection to the OpenAI compatible API
 /clear - Clear the AI chat history`;
 
       case '/models':
         try {
-          const response = await fetch(`${context.ollamaApiHost}/api/tags`);
-
-          if (!response.ok) {
-            throw new Error(`Ollama API error: ${response.status}`);
-          }
-
-          const data = await response.json();
+          const models = await context.loadModels();
+          context.setAvailableModels(models);
           let result = 'Available models:\n';
-          for (const model of data.models) {
-            result += `- ${model.name} (${model.size} bytes)\n`;
+          if (models.length === 0) {
+            result += '- No models returned. You can still enter a model manually in Settings.\n';
+          }
+          for (const model of models) {
+            result += `- ${model}\n`;
           }
           return result;
         } catch (error) {
-          return `Error: Failed to get models from Ollama API: ${error}`;
+          return `Error: Failed to get models from OpenAI compatible API: ${error}`;
         }
 
       case '/model':
         if (parts.length > 1) {
-          const modelName = parts[1];
+          const modelName = parts.slice(1).join(' ');
           try {
             context.setCurrentLLMModel(modelName);
+            context.saveSettings();
             return `Switched to model: ${modelName}`;
           } catch (error) {
             return `Error: Failed to switch model: ${error}`;
@@ -63,20 +67,21 @@ Available commands:
         if (parts.length > 1) {
           const hostUrl = parts.slice(1).join(' ');
           try {
-            context.setOllamaApiHost(hostUrl);
-            setTimeout(() => context.testOllamaConnection(), 100);
-            return `Changed Ollama API host to: ${hostUrl}`;
+            const normalizedHost = context.setApiBaseUrl(hostUrl);
+            context.saveSettings();
+            setTimeout(() => context.testOpenAiConnection(), 100);
+            return `Changed OpenAI compatible API host to: ${normalizedHost}`;
           } catch (error) {
             return `Error: Failed to set host: ${error}`;
           }
         }
-        return `Current Ollama API host: ${context.ollamaApiHost}`;
+        return `Current OpenAI compatible API host: ${context.apiBaseUrl}`;
 
       case '/retry':
         setTimeout(() => {
-          void context.retryOllamaConnection();
+          void context.retryOpenAiConnection();
         }, 100);
-        return 'Attempting to reconnect to Ollama API...';
+        return 'Attempting to reconnect to the OpenAI compatible API...';
 
       case '/clear':
         context.clearChatHistory();

@@ -39,7 +39,29 @@
   <!-- Right Panel - AI Chat - Only show when isAIPanelVisible is true -->
   <div class="panel ai-panel" *ngIf="isAIPanelVisible">
     <div class="panel-content">
-      <div class="output-area">
+      <div class="ai-panel-header">
+        <div class="ai-view-tabs">
+          <button
+            class="ai-view-tab"
+            [class.active]="activeAiView === 'chat'"
+            (click)="setActiveAiView('chat')"
+          >
+            Chat
+          </button>
+          <button
+            class="ai-view-tab"
+            [class.active]="activeAiView === 'settings'"
+            (click)="setActiveAiView('settings')"
+          >
+            Settings
+          </button>
+        </div>
+        <div class="current-model" [title]="currentLLMModel || 'No model selected'">
+          {{ currentLLMModel || 'No model selected' }}
+        </div>
+      </div>
+
+      <div class="output-area" *ngIf="activeAiView === 'chat'">
         <div class="chat-history">
           <div *ngFor="let entry of chatHistory; trackBy: trackByChatEntry" class="chat-entry">
             <!-- Add question display -->
@@ -90,10 +112,74 @@
           </div>
         </div>
       </div>
-      <div class="input-area">
+
+      <div class="settings-view output-area" *ngIf="activeAiView === 'settings'">
+        <div class="settings-section">
+          <label class="settings-label" for="apiBaseUrl">OpenAI Compatible Base URL</label>
+          <input
+            id="apiBaseUrl"
+            class="settings-input"
+            type="url"
+            [(ngModel)]="aiApiBaseUrl"
+            placeholder="https://api.openai.com/v1"
+            spellcheck="false"
+          />
+        </div>
+
+        <div class="settings-section">
+          <label class="settings-label" for="apiKey">API Key</label>
+          <input
+            id="apiKey"
+            class="settings-input"
+            type="password"
+            [(ngModel)]="aiApiKey"
+            placeholder="sk-..."
+            spellcheck="false"
+          />
+        </div>
+
+        <div class="settings-section">
+          <label class="settings-label" for="currentModel">Model</label>
+          <input
+            id="currentModel"
+            class="settings-input"
+            type="text"
+            [(ngModel)]="currentLLMModel"
+            placeholder="gpt-4.1-mini"
+            spellcheck="false"
+          />
+        </div>
+
+        <div class="settings-section" *ngIf="availableModels.length > 0">
+          <label class="settings-label" for="modelList">Loaded Models</label>
+          <select
+            id="modelList"
+            class="settings-input"
+            [ngModel]="currentLLMModel"
+            (ngModelChange)="onModelSelected($event)"
+          >
+            <option *ngFor="let model of availableModels" [value]="model">{{ model }}</option>
+          </select>
+        </div>
+
+        <div class="settings-actions">
+          <button class="settings-button" type="button" (click)="loadAvailableModels()" [disabled]="isLoadingModels">
+            {{ isLoadingModels ? 'Loading...' : 'Load Models' }}
+          </button>
+          <button class="settings-button primary" type="button" (click)="saveAiSettings()">
+            Save
+          </button>
+        </div>
+
+        <div class="settings-status" *ngIf="aiSettingsStatus">
+          {{ aiSettingsStatus }}
+        </div>
+      </div>
+
+      <div class="input-area" *ngIf="activeAiView === 'chat'">
         <div class="prompt-container">
           <textarea [(ngModel)]="currentQuestion" (keydown)="askAI($event)" (input)="autoResize($event)"
-            [disabled]="isProcessingAI" placeholder="Ask AI or type /help, /models, /model..." autofocus spellcheck="false"></textarea>
+            [disabled]="isProcessingAI" placeholder="Ask AI or type /help..." autofocus spellcheck="false"></textarea>
         </div>
       </div>
     </div>

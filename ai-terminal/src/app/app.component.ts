@@ -21,9 +21,16 @@ import { TerminalTabComponent } from './components/terminal-tab/terminal-tab.com
 import { IconComponent } from './components/icon/icon.component';
 import { AiCommandService } from './services/ai-command.service';
 import { AiResponseFormatService } from './services/ai-response-format.service';
-import { OllamaConnectionService } from './services/ollama-connection.service';
+import { OpenAiCompatibleConnectionService } from './services/open-ai-compatible-connection.service';
 import { TerminalSessionService } from './services/terminal-session.service';
 import { buildTerminalAssistantSystemPrompt } from './constants/ai.constants';
+
+interface StoredAiSettings {
+  apiBaseUrl?: string;
+  apiKey?: string;
+  currentModel?: string;
+  availableModels?: string[];
+}
 
 @Component({
   selector: 'app-root',
@@ -32,6 +39,8 @@ import { buildTerminalAssistantSystemPrompt } from './constants/ai.constants';
   styleUrl: './app.component.css'
 })
 export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
+  private readonly aiSettingsStorageKey = 'ai-terminal.openai-compatible-settings';
+
   // Terminal sessions
   terminalSessions: TerminalSession[] = [];
   activeSessionId: string = '';
@@ -46,8 +55,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   currentQuestion: string = '';
   isProcessingAI: boolean = false;
   isAIPanelVisible: boolean = true;
-  currentLLMModel: string = 'llama3.2:latest'; // Default model with proper namespace
-  ollamaApiHost: string = 'http://localhost:11434'; // Default Ollama host
+  activeAiView: 'chat' | 'settings' = 'chat';
+  aiApiBaseUrl: string = 'https://api.openai.com/v1';
+  aiApiKey: string = '';
+  currentLLMModel: string = '';
+  availableModels: string[] = [];
+  aiSettingsStatus: string = '';
+  isLoadingModels: boolean = false;
 
   // Resizing properties
   leftPanelWidth: number = 600;
@@ -81,8 +95,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
 
-  // New property for useProxy
-  useProxy: boolean = false;
   isSshSessionActive: boolean = false;
   currentSshUserHost: string | null = null;
 
@@ -90,7 +102,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     private sanitizer: DomSanitizer,
     private aiCommandService: AiCommandService,
     private aiResponseFormatService: AiResponseFormatService,
-    private ollamaConnectionService: OllamaConnectionService,
+    private openAiConnectionService: OpenAiCompatibleConnectionService,
     private terminalSessionService: TerminalSessionService
   ) { }
 
@@ -100,15 +112,86 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     return this.sanitizer.bypassSecurityTrustHtml(html);
   }
 
+  private loadAiSettings(): void {
+    const storedSettings = localStorage.getItem(this.aiSettingsStorageKey);
+    if (!storedSettings) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(storedSettings) as StoredAiSettings;
+      this.aiApiBaseUrl = this.openAiConnectionService.normalizeBaseUrl(
+        parsed.apiBaseUrl || this.aiApiBaseUrl
+      );
+      this.aiApiKey = parsed.apiKey || '';
+      this.currentLLMModel = parsed.currentModel || '';
+      this.availableModels = Array.isArray(parsed.availableModels) ? parsed.availableModels : [];
+    } catch (error) {
+      console.error('Failed to load AI settings:', error);
+      this.aiSettingsStatus = 'Could not load saved AI settings.';
+    }
+  }
+
+  saveAiSettings(): void {
+    this.aiApiBaseUrl = this.openAiConnectionService.normalizeBaseUrl(this.aiApiBaseUrl);
+    const settings: StoredAiSettings = {
+      apiBaseUrl: this.aiApiBaseUrl,
+      apiKey: this.aiApiKey,
+      currentModel: this.currentLLMModel,
+      availableModels: this.availableModels
+    };
+    localStorage.setItem(this.aiSettingsStorageKey, JSON.stringify(settings));
+    this.aiSettingsStatus = 'Settings saved.';
+  }
+
+  setActiveAiView(view: 'chat' | 'settings'): void {
+    this.activeAiView = view;
+  }
+
+  onModelSelected(model: string): void {
+    if (!model) {
+      return;
+    }
+    this.currentLLMModel = model;
+    this.saveAiSettings();
+    this.aiSettingsStatus = `Using model: ${model}`;
+  }
+
+  async loadAvailableModels(): Promise<void> {
+    if (!this.aiApiKey.trim()) {
+      this.aiSettingsStatus = 'Enter an API key before loading models.';
+      return;
+    }
+
+    this.isLoadingModels = true;
+    this.aiSettingsStatus = 'Loading models...';
+    try {
+      this.aiApiBaseUrl = this.openAiConnectionService.normalizeBaseUrl(this.aiApiBaseUrl);
+      const models = await this.openAiConnectionService.loadModels(this.aiApiBaseUrl, this.aiApiKey);
+      this.availableModels = models;
+      if (!this.currentLLMModel && models.length > 0) {
+        this.currentLLMModel = models[0];
+      }
+      this.saveAiSettings();
+      this.aiSettingsStatus = models.length > 0
+        ? `Loaded ${models.length} model${models.length === 1 ? '' : 's'}.`
+        : 'Connected, but no models were returned.';
+    } catch (error: any) {
+      console.error('Failed to load models:', error);
+      this.aiSettingsStatus = `Failed to load models: ${error.message || error}`;
+    } finally {
+      this.isLoadingModels = false;
+    }
+  }
+
   async ngOnInit() {
+    this.loadAiSettings();
+
     // Initialize first terminal session
     this.createNewSession('Terminal 1', true);
 
     // Clean any existing code blocks to ensure no backticks are displayed
     this.sanitizeAllCodeBlocks();
-
-    // Test the Ollama connection
-    await this.testOllamaConnection();
   }
 
   ngAfterViewInit(): void {
@@ -423,17 +506,24 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     return this.aiResponseFormatService.isSimpleCommand(code);
   }
 
-  // Helper method to directly call Ollama API from frontend
-  // Includes chat history and last 4 terminal commands for better context
-  async callOllamaDirectly(question: string, model: string): Promise<string> {
+  // Calls an OpenAI-compatible Chat Completions endpoint with terminal context.
+  async callOpenAiCompatibleApi(question: string, model: string): Promise<string> {
     try {
+      if (!this.aiApiKey.trim()) {
+        return 'Error: OpenAI compatible API key is not configured. Open Settings and add a key.';
+      }
+
+      if (!model.trim()) {
+        return 'Error: No model is selected. Open Settings, enter a model, or load models from your endpoint.';
+      }
+
       // Get the current operating system
       const os = navigator.platform.toLowerCase().includes('mac') ?
         'macOS' : 'Linux';
 
       const systemPrompt = buildTerminalAssistantSystemPrompt(os);
 
-      // Build messages array for /api/chat (includes conversation context)
+      // Build messages array with conversation context.
       const messages: { role: string; content: string }[] = [
         { role: 'system', content: systemPrompt }
       ];
@@ -482,29 +572,29 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         stream: false
       };
 
-      // Use /api/chat endpoint for proper conversation context
-      const apiEndpoint = this.useProxy ? '/api/chat' : `${this.ollamaApiHost}/api/chat`;
+      const normalizedBaseUrl = this.openAiConnectionService.normalizeBaseUrl(this.aiApiBaseUrl);
+      const apiEndpoint = `${normalizedBaseUrl}/chat/completions`;
 
       const response = await fetch(apiEndpoint, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.aiApiKey.trim()}`
         },
         body: JSON.stringify(requestBody)
       });
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`Ollama API error: ${response.status} - ${errorText}`);
+        throw new Error(`OpenAI compatible API error: ${response.status} - ${errorText}`);
       }
 
       const data = await response.json();
 
-      // /api/chat returns message.content (not response)
-      const content = data.message?.content ?? data.response;
+      const content = data.choices?.[0]?.message?.content;
       if (!content) {
         console.error('Unexpected response format:', data);
-        return 'Error: Unexpected response format from Ollama';
+        return 'Error: Unexpected response format from OpenAI compatible API';
       }
 
       return content;
@@ -512,10 +602,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       // Add more specific error messages for different failure types
       if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
-        return `Error: Could not connect to Ollama at ${this.ollamaApiHost}. Make sure Ollama is running.`;
+        return `Error: Could not connect to OpenAI compatible API at ${this.aiApiBaseUrl}. Check the endpoint and network connection.`;
       }
 
-      return `Error: ${error.message || 'Unknown error calling Ollama API'}`;
+      return `Error: ${error.message || 'Unknown error calling OpenAI compatible API'}`;
     }
   }
 
@@ -553,23 +643,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       if (isCommand) {
         response = await this.handleAICommand(this.currentQuestion);
       } else {
-        // Verify the model exists before calling Ollama
-        const modelExists = await this.checkModelExists(this.currentLLMModel);
+        response = await this.callOpenAiCompatibleApi(this.currentQuestion, this.currentLLMModel);
 
-        if (!modelExists) {
-          // The default model doesn't exist, and we've already tried to auto-switch
-          response = "Error: The model could not be found. Please check available models with /models and select one with /model [name].";
-        } else {
-          // Call Ollama directly
-          response = await this.callOllamaDirectly(this.currentQuestion, this.currentLLMModel);
-
-          // Check if the response contains a command we can execute
-          const commandParts = this.parseCommandFromResponse(response);
-          const hasCommands = commandParts.some(part => part.command);
-          if (hasCommands) {
-            // If this is a direct shell command question, we can enhance the UI by marking it as a command
-            chatEntry.isCommand = true;
-          }
+        // Check if the response contains a command we can execute
+        const commandParts = this.parseCommandFromResponse(response);
+        const hasCommands = commandParts.some(part => part.command);
+        if (hasCommands) {
+          // If this is a direct shell command question, we can enhance the UI by marking it as a command
+          chatEntry.isCommand = true;
         }
       }
 
@@ -608,20 +689,35 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   async handleAICommand(command: string): Promise<string> {
     return this.aiCommandService.handleAICommand(command, {
       currentLLMModel: this.currentLLMModel,
-      ollamaApiHost: this.ollamaApiHost,
+      apiBaseUrl: this.aiApiBaseUrl,
+      apiKey: this.aiApiKey,
+      availableModels: this.availableModels,
       setCurrentLLMModel: (model: string) => {
         this.currentLLMModel = model;
       },
-      setOllamaApiHost: (host: string) => {
-        this.ollamaApiHost = host;
+      setApiBaseUrl: (host: string) => {
+        this.aiApiBaseUrl = this.openAiConnectionService.normalizeBaseUrl(host);
+        return this.aiApiBaseUrl;
+      },
+      setAvailableModels: (models: string[]) => {
+        this.availableModels = models;
+      },
+      loadModels: async () => {
+        const models = await this.openAiConnectionService.loadModels(this.aiApiBaseUrl, this.aiApiKey);
+        this.availableModels = models;
+        this.saveAiSettings();
+        return models;
+      },
+      saveSettings: () => {
+        this.saveAiSettings();
       },
       clearChatHistory: () => {
         this.chatHistory = [];
       },
-      testOllamaConnection: () => {
-        void this.testOllamaConnection();
+      testOpenAiConnection: () => {
+        void this.testOpenAiConnection();
       },
-      retryOllamaConnection: async () => this.retryOllamaConnection()
+      retryOpenAiConnection: async () => this.retryOpenAiConnection()
     });
   }
 
@@ -674,13 +770,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  // Test the Ollama connection
-  async testOllamaConnection(): Promise<void> {
-    await this.ollamaConnectionService.testOllamaConnection({
-      ollamaApiHost: this.ollamaApiHost,
+  async testOpenAiConnection(): Promise<void> {
+    await this.openAiConnectionService.testOpenAiConnection({
+      apiBaseUrl: this.aiApiBaseUrl,
+      apiKey: this.aiApiKey,
       currentLLMModel: this.currentLLMModel,
       setCurrentLLMModel: (model: string) => {
         this.currentLLMModel = model;
+      },
+      setAvailableModels: (models: string[]) => {
+        this.availableModels = models;
+        this.saveAiSettings();
       },
       addChatEntry: (entry: ChatHistory) => {
         this.chatHistory.push(entry);
@@ -688,27 +788,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     });
   }
 
-  // Method to retry Ollama connection
-  async retryOllamaConnection(): Promise<void> {
-    await this.ollamaConnectionService.retryOllamaConnection({
-      ollamaApiHost: this.ollamaApiHost,
+  async retryOpenAiConnection(): Promise<void> {
+    await this.openAiConnectionService.retryOpenAiConnection({
+      apiBaseUrl: this.aiApiBaseUrl,
+      apiKey: this.aiApiKey,
       currentLLMModel: this.currentLLMModel,
       setCurrentLLMModel: (model: string) => {
         this.currentLLMModel = model;
       },
-      addChatEntry: (entry: ChatHistory) => {
-        this.chatHistory.push(entry);
-      }
-    });
-  }
-
-  // Check if a specific model exists in Ollama
-  async checkModelExists(modelName: string): Promise<boolean> {
-    return this.ollamaConnectionService.checkModelExists(modelName, {
-      ollamaApiHost: this.ollamaApiHost,
-      currentLLMModel: this.currentLLMModel,
-      setCurrentLLMModel: (model: string) => {
-        this.currentLLMModel = model;
+      setAvailableModels: (models: string[]) => {
+        this.availableModels = models;
+        this.saveAiSettings();
       },
       addChatEntry: (entry: ChatHistory) => {
         this.chatHistory.push(entry);
