@@ -1,8 +1,8 @@
 use crate::command::constants::COMMON_COMMANDS;
 use crate::command::types::command_manager::CommandManager;
-use crate::utils::file_system_utils::split_path_prefix;
+use crate::utils::file_system_utils::{resolve_path_input, split_path_prefix};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tauri::{command, State};
 
 #[command]
@@ -42,7 +42,9 @@ pub fn autocomplete(
             // Handle cd with no argument - show all directories in current folder
             ""
         }
-    } else if !input_parts.is_empty() && input_parts[0].contains('/') {
+    } else if !input_parts.is_empty()
+        && (input_parts[0].contains('/') || input_parts[0].contains('\\'))
+    {
         // Handle path directly
         input_parts[0]
     } else if input_parts.len() > 1 {
@@ -57,22 +59,10 @@ pub fn autocomplete(
     if input_parts.first() == Some(&"cd") || !path_to_complete.is_empty() {
         let (dir_to_search, prefix) = split_path_prefix(path_to_complete);
 
-        // Create a Path for the directory to search
-        let search_path = if dir_to_search.starts_with('/') || dir_to_search.starts_with('~') {
-            if dir_to_search.starts_with('~') {
-                let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-                let without_tilde = dir_to_search.trim_start_matches('~');
-                let rel_path = without_tilde.trim_start_matches('/');
-                if rel_path.is_empty() {
-                    home
-                } else {
-                    home.join(rel_path)
-                }
-            } else {
-                PathBuf::from(dir_to_search)
-            }
+        let search_path = if dir_to_search.is_empty() {
+            PathBuf::from(current_dir)
         } else {
-            Path::new(current_dir).join(dir_to_search)
+            resolve_path_input(current_dir, dir_to_search)?
         };
 
         if search_path.exists() && search_path.is_dir() {
@@ -97,8 +87,9 @@ pub fn autocomplete(
                     }
 
                     // Add trailing slash for directories
+                    let separator = path_separator_for_input(path_to_complete);
                     let suggestion = if is_dir {
-                        format!("{}/", file_name_str)
+                        format!("{}{}", file_name_str, separator)
                     } else {
                         file_name_str.to_string()
                     };
@@ -107,7 +98,11 @@ pub fn autocomplete(
                     let base_path = if dir_to_search.is_empty() {
                         "".to_string()
                     } else {
-                        format!("{}/", dir_to_search.trim_end_matches('/'))
+                        format!(
+                            "{}{}",
+                            dir_to_search.trim_end_matches(['/', '\\']),
+                            separator
+                        )
                     };
 
                     matches.push(format!("{}{}", base_path, suggestion));
@@ -131,4 +126,12 @@ fn autocomplete_base_command(input_prefix: &str) -> Vec<String> {
         .filter(|&command| command.starts_with(input_prefix))
         .map(|&command| command.to_string())
         .collect()
+}
+
+fn path_separator_for_input(input: &str) -> &'static str {
+    if input.contains('\\') {
+        "\\"
+    } else {
+        "/"
+    }
 }

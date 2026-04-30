@@ -14,7 +14,8 @@ A Tauri + Angular terminal application with integrated AI capabilities.
 
 - Node.js 18+
 - Rust and Cargo
-- For AI features: [Ollama](https://ollama.ai/) (can be installed with `brew install ollama`)
+- Windows builds require the Microsoft C++ Build Tools / MSVC Rust toolchain and the WebView2 Runtime
+- For AI features: [Ollama](https://ollama.ai/) (macOS: `brew install ollama`; Windows: download the installer from Ollama)
 
 ## Development Setup
 
@@ -46,6 +47,32 @@ After installation, you can launch the application from Spotlight or run it from
 
 ```bash
 ai-terminal
+```
+
+### Windows
+
+Download the latest Windows installer from the GitHub Releases page:
+
+- `ai-terminal_*_x64-setup.exe` for the NSIS installer
+- `ai-terminal_*_x64_en-US.msi` for the MSI installer
+
+If Windows asks for WebView2, install the Microsoft Edge WebView2 Runtime and launch AI Terminal again. AI features also require Ollama to be installed and running locally.
+
+### Building Windows from Source
+
+Install Node.js 18+, Rust with the MSVC toolchain, Microsoft C++ Build Tools, and the WebView2 Runtime. Then run:
+
+```powershell
+cd ai-terminal
+npm install
+npm run tauri build -- --bundles nsis,msi
+```
+
+Windows installers are generated in:
+
+```text
+src-tauri\target\release\bundle\nsis\
+src-tauri\target\release\bundle\msi\
 ```
 
 ## Quick Guide to Using Ollama to Download `macsdeve/BetterBash3` Model
@@ -86,6 +113,21 @@ ollama pull macsdeve/BetterBash3
 Open Terminal and execute:
 
 ```bash
+ollama pull macsdeve/BetterBash3
+```
+
+### Windows
+
+1. **Download Ollama**
+
+- Visit [Ollama download page](https://ollama.com/download/windows).
+- Download and run the Windows installer.
+
+2. **Download the Model**
+
+Open PowerShell and execute:
+
+```powershell
 ollama pull macsdeve/BetterBash3
 ```
 

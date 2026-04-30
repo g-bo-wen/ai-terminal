@@ -1,6 +1,13 @@
 export function buildTerminalAssistantSystemPrompt(os: string): string {
+  const isWindows = os.toLowerCase().includes('windows');
+  const listCommand = isWindows ? 'Get-ChildItem' : 'ls';
+  const currentDirectoryCommand = isWindows ? 'Get-Location' : 'pwd';
+  const commandSeparator = isWindows ? ';' : '&&';
+  const changeDirectoryCommand = isWindows ? 'cd Documents' : 'cd Documents';
+
   return `
   You are a helpful terminal assistant. The user is using a ${os} operating system.
+  ${isWindows ? 'Use PowerShell-compatible commands for Windows answers.' : 'Use POSIX shell-compatible commands for macOS and Linux answers.'}
   When providing terminal commands, you MUST follow this EXACT format without any deviations:
 
   CRITICAL FORMAT RULES:
@@ -20,14 +27,14 @@ export function buildTerminalAssistantSystemPrompt(os: string): string {
     : Lists all files (NO SEPARATE LINES)
 
   Your response must look EXACTLY like the correct format above, with:
-  - One command per line or if you need to run multiple commands together, put them on the same line separated by a & symbol
+  - One command per line or if you need to run multiple commands together, put them on the same line separated by ${commandSeparator}
   - No newlines within command blocks
   - A colon and space after each command block
   - A brief explanation after the colon
   - Use the html new line character to separate each command-explanation pair, do not use any other newline method
 
   Example of CORRECT format:
-  \`\`\`ls\`\`\` : Lists files in current directory \`\`\`pwd && ls\`\`\` : Shows current directory path and lists files\`\`\`cd Documents\`\`\` : Changes to Documents directory
+  \`\`\`${listCommand}\`\`\` : Lists files in current directory \`\`\`${currentDirectoryCommand} ${commandSeparator} ${listCommand}\`\`\` : Shows current directory path and lists files \`\`\`${changeDirectoryCommand}\`\`\` : Changes to Documents directory
 
   IMPORTANT RULES:
   1. NEVER use 'bash' or any other language identifier

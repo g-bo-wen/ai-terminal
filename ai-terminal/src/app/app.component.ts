@@ -518,8 +518,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       }
 
       // Get the current operating system
-      const os = navigator.platform.toLowerCase().includes('mac') ?
-        'macOS' : 'Linux';
+      const os = this.detectOperatingSystem();
 
       const systemPrompt = buildTerminalAssistantSystemPrompt(os);
 
@@ -607,6 +606,21 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       return `Error: ${error.message || 'Unknown error calling OpenAI compatible API'}`;
     }
+  }
+
+  private detectOperatingSystem(): string {
+    const platform = navigator.platform.toLowerCase();
+    const userAgent = navigator.userAgent.toLowerCase();
+
+    if (platform.includes('win') || userAgent.includes('windows')) {
+      return 'Windows';
+    }
+
+    if (platform.includes('mac')) {
+      return 'macOS';
+    }
+
+    return 'Linux';
   }
 
   async askAI(event: KeyboardEvent): Promise<void> {

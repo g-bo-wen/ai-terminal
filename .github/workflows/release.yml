@@ -94,7 +94,7 @@ jobs:
       - name: Build Linux DEB
         run: |
           cd ai-terminal
-          npm run tauri build
+          npm run tauri build -- --bundles deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -104,8 +104,43 @@ jobs:
           name: linux-deb
           path: ai-terminal/src-tauri/target/release/bundle/deb/*.deb
 
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          cd ai-terminal
+          npm ci
+
+      - name: Build Windows installers
+        run: |
+          cd ai-terminal
+          npm run tauri build -- --bundles nsis,msi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            ai-terminal/src-tauri/target/release/bundle/nsis/*.exe
+            ai-terminal/src-tauri/target/release/bundle/msi/*.msi
+
   release:
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,6 +158,12 @@ jobs:
         with:
           name: linux-deb
           path: artifacts/linux
+
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installers
+          path: artifacts/windows
 
       - name: Generate tag
         run: |
@@ -143,6 +184,8 @@ jobs:
           files: |
             artifacts/macos/*.dmg
             artifacts/linux/*.deb
+            artifacts/windows/*.exe
+            artifacts/windows/*.msi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

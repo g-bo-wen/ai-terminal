@@ -19,9 +19,9 @@ rustup target add x86_64-apple-darwin
 
 # Build both architectures
 echo "Building for ARM64..."
-npm run tauri build -- --target aarch64-apple-darwin
+npm run tauri build -- --target aarch64-apple-darwin --bundles app
 echo "Building for x86_64..."
-npm run tauri build -- --target x86_64-apple-darwin
+npm run tauri build -- --target x86_64-apple-darwin --bundles app
 
 # Create universal binary
 echo "Creating universal binary..."

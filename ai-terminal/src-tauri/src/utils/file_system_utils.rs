@@ -1,14 +1,19 @@
 use crate::command::types::command_manager::CommandManager;
 use std::env;
+use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 use tauri::{command, State};
 
+#[cfg(target_os = "windows")]
+pub fn get_shell_path() -> Option<String> {
+    env::var("PATH").ok()
+}
+
+#[cfg(not(target_os = "windows"))]
 pub fn get_shell_path() -> Option<String> {
     // First try to get the user's default shell
-    let shell = if cfg!(target_os = "windows") {
-        "cmd"
-    } else {
-        // Try to get the user's default shell from /etc/shells or fallback to common shells
+    let shell = {
         let shells = ["/bin/zsh", "/bin/bash", "/bin/sh"];
         for shell in shells.iter() {
             if std::path::Path::new(shell).exists() {
@@ -81,11 +86,52 @@ pub fn get_home_directory() -> Result<String, String> {
 
 // Helper function to split a path into directory and file prefix parts
 pub fn split_path_prefix(path: &str) -> (&str, &str) {
-    match path.rfind('/') {
+    match path.rfind(['/', '\\']) {
         Some(index) => {
             let (dir, file) = path.split_at(index + 1);
             (dir, file)
         }
         None => ("", path),
     }
+}
+
+pub fn is_absolute_path_input(path: &str) -> bool {
+    Path::new(path).is_absolute() || has_windows_drive_prefix(path)
+}
+
+pub fn expand_home_path(path: &str) -> Result<PathBuf, String> {
+    let home_dir =
+        dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
+    let without_tilde = path.trim_start_matches('~');
+    let rel_path = without_tilde.trim_start_matches(['/', '\\']);
+
+    if rel_path.is_empty() {
+        Ok(home_dir)
+    } else {
+        Ok(home_dir.join(rel_path))
+    }
+}
+
+pub fn resolve_path_input(current_dir: &str, path: &str) -> Result<PathBuf, String> {
+    if path.is_empty() || path == "~" || path == "~/" || path == "~\\" {
+        return expand_home_path("~");
+    }
+
+    if path.starts_with('~') {
+        return expand_home_path(path);
+    }
+
+    if is_absolute_path_input(path) {
+        return Ok(PathBuf::from(path));
+    }
+
+    Ok(Path::new(current_dir).join(path))
+}
+
+fn has_windows_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }

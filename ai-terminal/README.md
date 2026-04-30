@@ -33,9 +33,21 @@ After installation, you can launch the application from Spotlight or run it from
 ai-terminal
 ```
 
+### Windows
+
+Download the latest Windows installer from the GitHub Releases page:
+
+- `ai-terminal_*_x64-setup.exe` for the NSIS installer
+- `ai-terminal_*_x64_en-US.msi` for the MSI installer
+
+If Windows asks for WebView2, install the Microsoft Edge WebView2 Runtime. AI features require Ollama to be installed and running locally.
+
 ### Requirements
 
-- For AI features: [Ollama](https://ollama.ai/) (can be installed with `brew install ollama`)
+- Node.js 18+
+- Rust and Cargo
+- Windows builds require the Microsoft C++ Build Tools / MSVC Rust toolchain and the WebView2 Runtime
+- For AI features: [Ollama](https://ollama.ai/) (macOS: `brew install ollama`; Windows: download the installer from Ollama)
 
 ## Building from Source
 
@@ -62,6 +74,22 @@ chmod +x build-macos.sh
 ```
 
 This will create a universal binary DMG installer at `src-tauri/target/universal-apple-darwin/bundle/dmg/ai-terminal-[version].dmg`.
+
+### Windows Installers
+
+To build NSIS and MSI installers on Windows:
+
+```powershell
+npm install
+npm run tauri build -- --bundles nsis,msi
+```
+
+The installers are generated in:
+
+```text
+src-tauri\target\release\bundle\nsis\
+src-tauri\target\release\bundle\msi\
+```
 
 ## Contributing
 

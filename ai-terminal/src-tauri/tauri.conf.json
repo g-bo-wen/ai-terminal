@@ -29,7 +29,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app", "deb"],
+    "targets": ["dmg", "app", "deb", "nsis", "msi"],
     "publisher": "AI Terminal Foundation",
     "copyright": "© 2025 AI Terminal Foundation",
     "category": "DeveloperTool",

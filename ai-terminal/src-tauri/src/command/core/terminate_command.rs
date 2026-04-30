@@ -38,6 +38,23 @@ pub fn terminate_command(
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()
+            .map_err(|err| format!("Failed to start taskkill: {}", err))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                format!("Failed to terminate process {}", pid)
+            } else {
+                stderr
+            });
+        }
+    }
+
     // Clear the PID after successful termination
     if let Some(state) = states.get_mut(&key) {
         state.pid = None;

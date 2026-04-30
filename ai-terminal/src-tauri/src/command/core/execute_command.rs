@@ -1,10 +1,10 @@
 use crate::command::types::command_manager::CommandManager;
 use crate::command::types::command_state::CommandState;
-use crate::utils::file_system_utils::get_shell_path;
+use crate::utils::file_system_utils::{get_shell_path, resolve_path_input};
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{env, thread};
@@ -157,53 +157,15 @@ pub fn execute_command(
         let command_state_cd = get_command_state(&mut states_guard_cd, session_id.clone());
 
         let path = command.trim_start_matches("cd").trim();
-        if path.is_empty() || path == "~" || path == "~/" {
-            return if let Some(home_dir) = dirs::home_dir() {
-                let home_path = home_dir.to_string_lossy().to_string();
-                command_state_cd.current_dir = home_path.clone();
-                drop(states_guard_cd); // Release lock before emitting and returning
-                let _ = app_handle.emit("command_end", "Command completed successfully.");
-                Ok(format!("Changed directory to {}", home_path))
-            } else {
+        let new_path = match resolve_path_input(&command_state_cd.current_dir, path) {
+            Ok(path) => path,
+            Err(error) => {
                 drop(states_guard_cd);
                 let _ = app_handle.emit("command_end", "Command failed.");
-                Err("Could not determine home directory".to_string())
-            };
-        }
-        let current_path = Path::new(&command_state_cd.current_dir);
-        let new_path = if path.starts_with('~') {
-            if let Some(home_dir) = dirs::home_dir() {
-                let without_tilde = path.trim_start_matches('~');
-                let rel_path = without_tilde.trim_start_matches('/');
-                if rel_path.is_empty() {
-                    home_dir
-                } else {
-                    home_dir.join(rel_path)
-                }
-            } else {
-                drop(states_guard_cd);
-                return Err("Could not determine home directory".to_string());
+                return Err(error);
             }
-        } else if path.starts_with('/') {
-            std::path::PathBuf::from(path)
-        } else {
-            let mut result_path = current_path.to_path_buf();
-            let path_components: Vec<&str> = path.split('/').collect();
-            for component in path_components {
-                if component == ".." {
-                    if let Some(parent) = result_path.parent() {
-                        result_path = parent.to_path_buf();
-                    } else {
-                        drop(states_guard_cd);
-                        let _ = app_handle.emit("command_end", "Command failed.");
-                        return Err("Already at root directory".to_string());
-                    }
-                } else if component != "." && !component.is_empty() {
-                    result_path = result_path.join(component);
-                }
-            }
-            result_path
         };
+
         return if new_path.exists() {
             command_state_cd.current_dir = new_path.to_string_lossy().to_string();
             let current_dir_for_ok = command_state_cd.current_dir.clone();
@@ -364,17 +326,17 @@ pub fn execute_command(
             }
         };
     } else {
-        // Fallback to sh -c for non-SSH or sudo commands
+        // Fallback to the platform shell for non-SSH or sudo commands
         let final_shell_command = if original_command_is_sudo && !original_command_is_sudo_ssh {
+            command_to_run.clone()
+        } else if cfg!(target_os = "windows") {
             command_to_run.clone()
         } else {
             format!("exec {}", command_to_run)
         };
 
-        let mut sh_cmd_to_spawn = Command::new("sh");
+        let mut sh_cmd_to_spawn = new_platform_shell_command(&final_shell_command);
         sh_cmd_to_spawn
-            .arg("-c")
-            .arg(&final_shell_command)
             .current_dir(&current_dir_clone)
             .envs(&env_map)
             .stdout(Stdio::piped())
@@ -768,151 +730,163 @@ pub fn execute_sudo_command(
     app_handle: AppHandle,
     command_manager: State<'_, CommandManager>,
 ) -> Result<String, String> {
-    let mut states = command_manager.commands.lock().map_err(|e| e.to_string())?;
-
-    let key = session_id;
-    let state = states.entry(key.clone()).or_insert_with(|| CommandState {
-        current_dir: env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string(),
-        child_wait_handle: None,
-        child_stdin: None,
-        pid: None,
-        is_ssh_session_active: false,
-        remote_current_dir: None,
-    });
-
-    let current_dir = state.current_dir.clone();
-
-    let mut child_process = match Command::new("sudo")
-        .arg("-S")
-        .arg("bash")
-        .arg("-c")
-        .arg(
-            command
-                .split_whitespace()
-                .skip(1)
-                .collect::<Vec<&str>>()
-                .join(" "),
-        ) // Skip "sudo" and join the rest
-        .current_dir(&current_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    #[cfg(target_os = "windows")]
     {
-        Ok(child) => child,
-        Err(e) => {
-            return Err(format!("Failed to start sudo command: {}", e));
-        }
-    };
-
-    let child_pid = child_process.id(); // Get PID
-    let sudo_stdin = child_process.stdin.take().map(|s| Arc::new(Mutex::new(s))); // Take stdin
-    let sudo_stdout = child_process.stdout.take(); // Take stdout
-    let sudo_stderr = child_process.stderr.take(); // Take stderr
-
-    let child_arc = Arc::new(Mutex::new(child_process)); // Store the Child itself for waiting
-
-    state.child_wait_handle = Some(child_arc.clone()); // Store wait handle
-    state.pid = Some(child_pid); // Store PID
-                                 // For sudo, is_ssh_session_active remains false, child_stdin for SSH is not set.
-
-    // Send password to stdin
-    if let Some(stdin_arc) = sudo_stdin {
-        // Use the taken and Arc-wrapped stdin
-        let app_handle_stdin = app_handle.clone();
-        thread::spawn(move || {
-            let mut stdin_guard = match stdin_arc.lock() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    let _ = app_handle_stdin.emit("command_error", e.to_string());
-                    return;
-                }
-            };
-            if stdin_guard
-                .write_all(format!("{}", password).as_bytes())
-                .is_err()
-            {
-                let _ = app_handle_stdin.emit("command_error", "Failed to send password to sudo");
-            }
-        });
+        let _ = app_handle.emit("command_end", "Command failed.");
+        drop(command_manager);
+        return Err("sudo commands are not supported on Windows. Run AI Terminal as administrator or use a PowerShell command with elevated permissions.".to_string());
     }
 
-    // Use the taken stdout_stream
-    if let Some(stdout_stream) = sudo_stdout {
-        let app_handle_stdout = app_handle.clone();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout_stream);
-            let mut buffer = [0; 2048]; // Read in chunks
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        let output_chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
-                        let _ = app_handle_stdout.emit("command_output", output_chunk);
-                    }
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        let _ = app_handle_stdout
-                            .emit("command_output", format!("Error reading stdout: {}", e));
-                        break;
-                    }
-                }
-            }
-        });
-    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut states = command_manager.commands.lock().map_err(|e| e.to_string())?;
 
-    // Use the taken stderr_stream
-    if let Some(stderr_stream) = sudo_stderr {
-        let app_handle_stderr = app_handle.clone();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stderr_stream);
-            let mut buffer = [0; 2048]; // Read in chunks
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        let error_chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
-                        if !error_chunk.contains("[sudo] password") {
-                            let _ = app_handle_stderr.emit("command_error", error_chunk.clone());
-                        }
-                    }
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        let _ = app_handle_stderr
-                            .emit("command_error", format!("Error reading stderr: {}", e));
-                        break;
-                    }
-                }
-            }
+        let key = session_id;
+        let state = states.entry(key.clone()).or_insert_with(|| CommandState {
+            current_dir: env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            child_wait_handle: None,
+            child_stdin: None,
+            pid: None,
+            is_ssh_session_active: false,
+            remote_current_dir: None,
         });
-    }
 
-    let child_arc_clone = child_arc.clone();
-    let app_handle_wait = app_handle.clone();
-    thread::spawn(move || {
-        let status = {
-            let mut child_guard = child_arc_clone.lock().unwrap();
-            match child_guard.wait() {
-                Ok(status) => status,
-                Err(e) => {
-                    let _ = app_handle_wait
-                        .emit("command_error", format!("Error waiting for command: {}", e));
-                    return;
-                }
+        let current_dir = state.current_dir.clone();
+
+        let mut child_process = match Command::new("sudo")
+            .arg("-S")
+            .arg("bash")
+            .arg("-c")
+            .arg(
+                command
+                    .split_whitespace()
+                    .skip(1)
+                    .collect::<Vec<&str>>()
+                    .join(" "),
+            ) // Skip "sudo" and join the rest
+            .current_dir(&current_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                return Err(format!("Failed to start sudo command: {}", e));
             }
         };
 
-        let _ = app_handle_wait.emit("command_end", format!("Success: {}", status.success()));
-    });
+        let child_pid = child_process.id(); // Get PID
+        let sudo_stdin = child_process.stdin.take().map(|s| Arc::new(Mutex::new(s))); // Take stdin
+        let sudo_stdout = child_process.stdout.take(); // Take stdout
+        let sudo_stderr = child_process.stderr.take(); // Take stderr
 
-    Ok("Command started. Output will stream in realtime.".to_string())
+        let child_arc = Arc::new(Mutex::new(child_process)); // Store the Child itself for waiting
+
+        state.child_wait_handle = Some(child_arc.clone()); // Store wait handle
+        state.pid = Some(child_pid); // Store PID
+                                     // For sudo, is_ssh_session_active remains false, child_stdin for SSH is not set.
+
+        // Send password to stdin
+        if let Some(stdin_arc) = sudo_stdin {
+            // Use the taken and Arc-wrapped stdin
+            let app_handle_stdin = app_handle.clone();
+            thread::spawn(move || {
+                let mut stdin_guard = match stdin_arc.lock() {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        let _ = app_handle_stdin.emit("command_error", e.to_string());
+                        return;
+                    }
+                };
+                if stdin_guard
+                    .write_all(format!("{}", password).as_bytes())
+                    .is_err()
+                {
+                    let _ =
+                        app_handle_stdin.emit("command_error", "Failed to send password to sudo");
+                }
+            });
+        }
+
+        // Use the taken stdout_stream
+        if let Some(stdout_stream) = sudo_stdout {
+            let app_handle_stdout = app_handle.clone();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stdout_stream);
+                let mut buffer = [0; 2048]; // Read in chunks
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let output_chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
+                            let _ = app_handle_stdout.emit("command_output", output_chunk);
+                        }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            let _ = app_handle_stdout
+                                .emit("command_output", format!("Error reading stdout: {}", e));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Use the taken stderr_stream
+        if let Some(stderr_stream) = sudo_stderr {
+            let app_handle_stderr = app_handle.clone();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stderr_stream);
+                let mut buffer = [0; 2048]; // Read in chunks
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let error_chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
+                            if !error_chunk.contains("[sudo] password") {
+                                let _ =
+                                    app_handle_stderr.emit("command_error", error_chunk.clone());
+                            }
+                        }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            let _ = app_handle_stderr
+                                .emit("command_error", format!("Error reading stderr: {}", e));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        let child_arc_clone = child_arc.clone();
+        let app_handle_wait = app_handle.clone();
+        thread::spawn(move || {
+            let status = {
+                let mut child_guard = child_arc_clone.lock().unwrap();
+                match child_guard.wait() {
+                    Ok(status) => status,
+                    Err(e) => {
+                        let _ = app_handle_wait
+                            .emit("command_error", format!("Error waiting for command: {}", e));
+                        return;
+                    }
+                }
+            };
+
+            let _ = app_handle_wait.emit("command_end", format!("Success: {}", status.success()));
+        });
+
+        Ok("Command started. Output will stream in realtime.".to_string())
+    }
 }
 
 fn get_command_state<'a>(
@@ -932,4 +906,24 @@ fn get_command_state<'a>(
             is_ssh_session_active: false, // ensure default
             remote_current_dir: None,
         })
+}
+
+#[cfg(target_os = "windows")]
+fn new_platform_shell_command(command: &str) -> Command {
+    let mut shell = Command::new("powershell.exe");
+    shell
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(command);
+    shell
+}
+
+#[cfg(not(target_os = "windows"))]
+fn new_platform_shell_command(command: &str) -> Command {
+    let mut shell = Command::new("sh");
+    shell.arg("-c").arg(command);
+    shell
 }

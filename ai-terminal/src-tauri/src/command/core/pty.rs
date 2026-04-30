@@ -1,8 +1,9 @@
 use crate::command::types::pty_manager::{PtyManager, PtySession};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
-use std::path::Path;
 use std::io::{Read, Write};
+#[cfg(not(target_os = "windows"))]
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tauri::{command, AppHandle, Emitter, Manager, State};
@@ -39,29 +40,7 @@ pub fn pty_create_session(
         })
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
-    // Prefer a clean bash session for embedded PTY stability.
-    // This avoids shell theme artifacts and prompt control sequences.
-    let preferred_bash = "/bin/bash";
-    let shell = if Path::new(preferred_bash).exists() {
-        preferred_bash.to_string()
-    } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
-    };
-    let mut command = CommandBuilder::new(shell.clone());
-    if shell.ends_with("bash") {
-        command.arg("--noprofile");
-        command.arg("--norc");
-        command.env("BASH_SILENCE_DEPRECATION_WARNING", "1");
-        command.env("PROMPT_COMMAND", "");
-        command.env("PS1", "\\[\\033[1;34m\\]\\w\\[\\033[0m\\] $ ");
-    } else if shell.ends_with("zsh") {
-        command.arg("-f");
-        command.env("PROMPT", "%n@%m %1~ %# ");
-        command.env("RPROMPT", "");
-        command.env("PROMPT_EOL_MARK", "");
-        command.env("PS1", "%n@%m %1~ %# ");
-    }
-    command.arg("-i");
+    let mut command = new_platform_pty_command();
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
 
@@ -154,8 +133,10 @@ pub fn pty_create_session(
                                     let invalid_len = error_len.min(pending_utf8_bytes.len());
                                     if invalid_len > 0 {
                                         emit_output(
-                                            String::from_utf8_lossy(&pending_utf8_bytes[..invalid_len])
-                                                .to_string(),
+                                            String::from_utf8_lossy(
+                                                &pending_utf8_bytes[..invalid_len],
+                                            )
+                                            .to_string(),
                                         );
                                         pending_utf8_bytes.drain(..invalid_len);
                                         continue;
@@ -204,6 +185,42 @@ pub fn pty_create_session(
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn new_platform_pty_command() -> CommandBuilder {
+    let mut command = CommandBuilder::new("powershell.exe");
+    command.arg("-NoLogo");
+    command.arg("-NoProfile");
+    command
+}
+
+#[cfg(not(target_os = "windows"))]
+fn new_platform_pty_command() -> CommandBuilder {
+    // Prefer a clean bash session for embedded PTY stability.
+    // This avoids shell theme artifacts and prompt control sequences.
+    let preferred_bash = "/bin/bash";
+    let shell = if Path::new(preferred_bash).exists() {
+        preferred_bash.to_string()
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    };
+    let mut command = CommandBuilder::new(shell.clone());
+    if shell.ends_with("bash") {
+        command.arg("--noprofile");
+        command.arg("--norc");
+        command.env("BASH_SILENCE_DEPRECATION_WARNING", "1");
+        command.env("PROMPT_COMMAND", "");
+        command.env("PS1", "\\[\\033[1;34m\\]\\w\\[\\033[0m\\] $ ");
+    } else if shell.ends_with("zsh") {
+        command.arg("-f");
+        command.env("PROMPT", "%n@%m %1~ %# ");
+        command.env("RPROMPT", "");
+        command.env("PROMPT_EOL_MARK", "");
+        command.env("PS1", "%n@%m %1~ %# ");
+    }
+    command.arg("-i");
+    command
+}
+
 #[command]
 pub fn pty_write(
     session_id: String,
@@ -250,7 +267,10 @@ pub fn pty_resize(
 }
 
 #[command]
-pub fn pty_close_session(session_id: String, pty_manager: State<'_, PtyManager>) -> Result<(), String> {
+pub fn pty_close_session(
+    session_id: String,
+    pty_manager: State<'_, PtyManager>,
+) -> Result<(), String> {
     let session_opt = {
         let mut sessions = pty_manager.sessions.lock().map_err(|e| e.to_string())?;
         sessions.remove(&session_id)

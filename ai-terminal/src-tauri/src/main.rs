@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "windows"))]
 extern crate fix_path_env;
 
 use ai_terminal_lib::command::types::command_manager::CommandManager;
@@ -6,6 +7,7 @@ use ai_terminal_lib::{command, ollama, utils};
 use std::env;
 
 fn main() {
+    #[cfg(not(target_os = "windows"))]
     let _ = fix_path_env::fix();
 
     let command_manager = CommandManager::new();
