@@ -51,7 +51,9 @@ pub fn pty_create_session(
         .slave
         .spawn_command(command)
         .map_err(|e| format!("Failed to spawn shell in PTY: {e}"))?;
+    let killer = child.clone_killer();
     let child = Arc::new(Mutex::new(child));
+    let killer = Arc::new(Mutex::new(killer));
 
     let writer = pair
         .master
@@ -76,6 +78,7 @@ pub fn pty_create_session(
                 master: pair.master,
                 writer: writer.clone(),
                 child: child.clone(),
+                killer: killer.clone(),
             },
         );
     }
@@ -278,13 +281,13 @@ pub fn pty_close_session(
     };
 
     if let Some(session) = session_opt {
-        match session.child.try_lock() {
-            Ok(mut child) => {
-                let _ = child.kill();
+        match session.killer.lock() {
+            Ok(mut killer) => {
+                let _ = killer.kill();
             }
-            Err(_would_block_or_poisoned) => {
-                // A wait thread may currently hold the child lock. Avoid blocking the
-                // Tauri command thread; dropping the session still detaches the tab.
+            Err(_poisoned) => {
+                // If the killer mutex is poisoned, the wait thread will still
+                // reap the process and emit the exit event shortly after.
             }
         }
         Ok(())

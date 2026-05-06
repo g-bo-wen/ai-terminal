@@ -77,6 +77,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private terminal: Terminal | null = null;
   private fitAddon: FitAddon | null = null;
   private ptySessions = new Set<string>();
+  private pendingPtySessions = new Set<string>();
   private ptyBufferBySession = new Map<string, string>();
   private _shouldScroll = false;
   private scrollFramePending = false;
@@ -263,22 +264,29 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const unlistenPtyExit = await listen('pty_exit', (event) => {
       const payload = event.payload as { sessionId: string; success: boolean };
       this.ptySessions.delete(payload.sessionId);
+      this.pendingPtySessions.delete(payload.sessionId);
     });
 
     this.unlistenFunctions.push(unlistenPtyOutput, unlistenPtyExit);
   }
 
   private async ensurePtySession(sessionId: string): Promise<void> {
-    if (!this.terminal || this.ptySessions.has(sessionId)) {
+    if (!this.terminal || this.ptySessions.has(sessionId) || this.pendingPtySessions.has(sessionId)) {
       return;
     }
 
     const cols = this.terminal.cols || 80;
     const rows = this.terminal.rows || 24;
-    await invoke<void>('pty_create_session', { sessionId, cols, rows });
-    this.ptySessions.add(sessionId);
-    if (!this.ptyBufferBySession.has(sessionId)) {
-      this.ptyBufferBySession.set(sessionId, '');
+    this.pendingPtySessions.add(sessionId);
+
+    try {
+      await invoke<void>('pty_create_session', { sessionId, cols, rows });
+      this.ptySessions.add(sessionId);
+      if (!this.ptyBufferBySession.has(sessionId)) {
+        this.ptyBufferBySession.set(sessionId, '');
+      }
+    } finally {
+      this.pendingPtySessions.delete(sessionId);
     }
   }
 
@@ -316,6 +324,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         // Ignore close failures during shutdown.
       });
     }
+    this.pendingPtySessions.clear();
     this.terminal?.dispose();
     this.fitAddon = null;
     this.terminal = null;
@@ -832,9 +841,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     if (shouldActivate) {
       this.switchToSession(sessionId);
-    }
-
-    if (this.terminal) {
+    } else if (this.terminal) {
       void this.ensurePtySession(sessionId);
     }
 
