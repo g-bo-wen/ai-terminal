@@ -78,9 +78,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private fitAddon: FitAddon | null = null;
   private ptySessions = new Set<string>();
   private ptyBufferBySession = new Map<string, string>();
-  private ptyStartupBufferBySession = new Map<string, string>();
-  private ptyStartupSettledSessions = new Set<string>();
-  private ptyStartupTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private _shouldScroll = false;
   private scrollFramePending = false;
   get shouldScroll(): boolean {
@@ -255,24 +252,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const unlistenPtyOutput = await listen('pty_output', (event) => {
       const payload = event.payload as { sessionId: string; data: string };
 
-      if (!this.ptyStartupSettledSessions.has(payload.sessionId)) {
-        // Buffer all data during the startup phase (not written to xterm).
-        const existing = this.ptyStartupBufferBySession.get(payload.sessionId) || '';
-        this.ptyStartupBufferBySession.set(payload.sessionId, existing + payload.data);
-
-        // Reset the settle timer on every chunk so we wait for a quiet period.
-        const existingTimer = this.ptyStartupTimers.get(payload.sessionId);
-        if (existingTimer) {
-          clearTimeout(existingTimer);
-        }
-        this.ptyStartupTimers.set(
-          payload.sessionId,
-          setTimeout(() => this.settlePtyStartup(payload.sessionId), 300)
-        );
-        return;
-      }
-
-      // Post-startup: write directly to xterm and the replay buffer.
       const previous = this.ptyBufferBySession.get(payload.sessionId) || '';
       this.ptyBufferBySession.set(payload.sessionId, previous + payload.data);
 
@@ -284,38 +263,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const unlistenPtyExit = await listen('pty_exit', (event) => {
       const payload = event.payload as { sessionId: string; success: boolean };
       this.ptySessions.delete(payload.sessionId);
-      this.ptyStartupBufferBySession.delete(payload.sessionId);
-      this.ptyStartupSettledSessions.delete(payload.sessionId);
-      const timer = this.ptyStartupTimers.get(payload.sessionId);
-      if (timer) {
-        clearTimeout(timer);
-        this.ptyStartupTimers.delete(payload.sessionId);
-      }
     });
 
     this.unlistenFunctions.push(unlistenPtyOutput, unlistenPtyExit);
-  }
-
-  /**
-   * Called once the PTY startup phase is considered settled (no new output
-   * for 300 ms). Discards any noisy startup data, resets xterm, and asks the
-   * shell to redraw a clean prompt via Ctrl-L.
-   */
-  private settlePtyStartup(sessionId: string): void {
-    this.ptyStartupBufferBySession.delete(sessionId);
-    this.ptyStartupTimers.delete(sessionId);
-    this.ptyStartupSettledSessions.add(sessionId);
-
-    // Reset the replay buffer so tab-switching won't replay startup noise.
-    this.ptyBufferBySession.set(sessionId, '');
-
-    if (sessionId === this.activeSessionId && this.terminal) {
-      this.terminal.reset();
-    }
-
-    // Send Ctrl-L (form-feed) to the shell; bash/zsh interpret this as
-    // "clear screen and redraw prompt", giving us a clean terminal.
-    invoke<void>('pty_write', { sessionId, data: '\x0c' }).catch(() => {});
   }
 
   private async ensurePtySession(sessionId: string): Promise<void> {
@@ -330,8 +280,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (!this.ptyBufferBySession.has(sessionId)) {
       this.ptyBufferBySession.set(sessionId, '');
     }
-    this.ptyStartupBufferBySession.set(sessionId, '');
-    this.ptyStartupSettledSessions.delete(sessionId);
   }
 
   private renderActivePtyBuffer(): void {
@@ -368,11 +316,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         // Ignore close failures during shutdown.
       });
     }
-    // Clear any pending startup timers.
-    for (const timer of this.ptyStartupTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.ptyStartupTimers.clear();
     this.terminal?.dispose();
     this.fitAddon = null;
     this.terminal = null;
@@ -943,8 +886,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       });
       this.ptySessions.delete(sessionId);
       this.ptyBufferBySession.delete(sessionId);
-      this.ptyStartupBufferBySession.delete(sessionId);
-      this.ptyStartupSettledSessions.delete(sessionId);
     }
 
     if (nextActiveSessionId) {

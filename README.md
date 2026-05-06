@@ -65,7 +65,7 @@ Install Node.js 18+, Rust with the MSVC toolchain, Microsoft C++ Build Tools, an
 ```powershell
 cd ai-terminal
 npm install
-npm run tauri build -- --bundles nsis,msi
+npm run tauri build -- --bundles=nsis,msi
 ```
 
 Windows installers are generated in:

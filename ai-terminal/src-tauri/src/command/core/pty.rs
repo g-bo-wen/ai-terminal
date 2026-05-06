@@ -190,6 +190,7 @@ fn new_platform_pty_command() -> CommandBuilder {
     let mut command = CommandBuilder::new("powershell.exe");
     command.arg("-NoLogo");
     command.arg("-NoProfile");
+    command.arg("-NoExit");
     command
 }
 
