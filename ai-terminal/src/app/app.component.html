@@ -16,6 +16,14 @@
             +
           </button>
           <button
+            class="connection-toolbar-button"
+            type="button"
+            (click)="openConnectionManager()"
+            title="Manage connection profiles"
+          >
+            Connection
+          </button>
+          <button
             class="ai-panel-toggle"
             (click)="toggleAIPanel()"
             [title]="isAIPanelVisible ? 'Hide AI panel' : 'Show AI panel'"
@@ -180,6 +188,210 @@
         <div class="prompt-container">
           <textarea [(ngModel)]="currentQuestion" (keydown)="askAI($event)" (input)="autoResize($event)"
             [disabled]="isProcessingAI" placeholder="Ask AI or type /help..." autofocus spellcheck="false"></textarea>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="connection-modal-backdrop" *ngIf="isConnectionManagerOpen" (click)="closeConnectionManager()">
+  <div class="connection-modal manager-modal" (click)="$event.stopPropagation()">
+    <div class="connection-modal-header">
+      <div>
+        <div class="connections-title">Connection Profiles</div>
+        <div class="connections-subtitle">{{ connectionProfiles.length }} saved</div>
+      </div>
+      <div class="connection-modal-actions">
+        <button class="settings-button primary" type="button" (click)="startNewConnectionProfile()">
+          New
+        </button>
+        <button class="icon-text-button" type="button" (click)="closeConnectionManager()" title="Close">
+          ×
+        </button>
+      </div>
+    </div>
+
+    <div class="connections-list" *ngIf="connectionProfiles.length > 0; else emptyConnections">
+      <div
+        class="connection-row"
+        *ngFor="let profile of connectionProfiles; trackBy: trackByConnectionProfileId"
+      >
+        <div class="connection-main">
+          <div class="connection-name-line">
+            <span class="connection-name">{{ profile.name }}</span>
+            <span class="connection-type">{{ getConnectionTypeLabel(profile.type) }}</span>
+          </div>
+          <div class="connection-display-name">
+            {{ generateConnectionDisplayName(profile) }}
+          </div>
+          <div class="connection-meta">
+            <span *ngIf="profile.jumpHost">Jump {{ profile.jumpUser ? profile.jumpUser + '@' : '' }}{{ profile.jumpHost }}{{ profile.jumpPort ? ':' + profile.jumpPort : '' }}</span>
+            <span *ngIf="profile.targetHost">Target {{ profile.targetUser ? profile.targetUser + '@' : '' }}{{ profile.targetHost }}{{ profile.targetPort ? ':' + profile.targetPort : '' }}</span>
+            <span>Last {{ formatConnectionTime(profile.lastConnectedAt) }}</span>
+          </div>
+          <div class="connection-tags" *ngIf="profile.tags.length > 0">
+            <span class="connection-tag" *ngFor="let tag of profile.tags">{{ tag }}</span>
+          </div>
+        </div>
+        <div class="connection-actions">
+          <button class="settings-button" type="button" (click)="connectConnectionProfile(profile)">
+            Connect
+          </button>
+          <button class="settings-button" type="button" (click)="editConnectionProfile(profile)">
+            Edit
+          </button>
+          <button class="settings-button" type="button" (click)="duplicateConnectionProfile(profile)">
+            Duplicate
+          </button>
+          <button class="settings-button danger" type="button" (click)="deleteConnectionProfile(profile)">
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <ng-template #emptyConnections>
+      <div class="empty-connections">
+        No connection profiles yet.
+      </div>
+    </ng-template>
+
+    <div class="settings-status" *ngIf="connectionStatus && !isConnectionFormOpen">
+      {{ connectionStatus }}
+    </div>
+
+    <div class="connection-form-backdrop" *ngIf="isConnectionFormOpen" (click)="closeConnectionForm()">
+      <div class="connection-modal form-modal" (click)="$event.stopPropagation()">
+        <div class="connection-modal-header">
+          <div>
+            <div class="connections-title">
+              {{ connectionFormMode === 'edit' ? 'Edit Profile' : 'New Profile' }}
+            </div>
+            <div class="connections-subtitle">Passwords are currently saved in localStorage as plain text.</div>
+          </div>
+          <button class="icon-text-button" type="button" (click)="closeConnectionForm()" title="Close">
+            ×
+          </button>
+        </div>
+
+        <div class="connection-form">
+          <div class="connection-form-grid">
+            <div class="settings-section">
+              <label class="settings-label" for="connectionName">Name</label>
+              <input id="connectionName" class="settings-input" type="text" [(ngModel)]="connectionForm.name" placeholder="prod-order" />
+            </div>
+
+            <div class="settings-section">
+              <label class="settings-label" for="connectionType">Type</label>
+              <select id="connectionType" class="settings-input" [(ngModel)]="connectionForm.type">
+                <option value="ssh">SSH</option>
+                <option value="jumpserver">JumpServer</option>
+              </select>
+            </div>
+
+            <div class="settings-section">
+              <label class="settings-label" for="authMethod">Auth Method</label>
+              <select id="authMethod" class="settings-input" [(ngModel)]="connectionForm.authMethod">
+                <option value="manual">Manual</option>
+                <option value="password">Password</option>
+                <option value="privateKey">Private Key</option>
+                <option value="sshAgent">SSH Agent</option>
+              </select>
+            </div>
+
+            <div class="settings-section">
+              <label class="settings-label" for="connectionTags">Tags</label>
+              <input id="connectionTags" class="settings-input" type="text" [(ngModel)]="connectionForm.tagsText" placeholder="prod, order" />
+            </div>
+          </div>
+
+          <div class="connection-section" *ngIf="connectionForm.type === 'jumpserver'">
+            <div class="connection-section-title">JumpServer</div>
+            <div class="connection-form-grid">
+              <div class="settings-section">
+                <label class="settings-label" for="jumpHost">Host</label>
+                <input id="jumpHost" class="settings-input" type="text" [(ngModel)]="connectionForm.jumpHost" placeholder="jump.company.local" />
+              </div>
+              <div class="settings-section">
+                <label class="settings-label" for="jumpPort">Port</label>
+                <input id="jumpPort" class="settings-input" type="number" min="1" [(ngModel)]="connectionForm.jumpPort" placeholder="22" />
+              </div>
+              <div class="settings-section">
+                <label class="settings-label" for="jumpUser">User</label>
+                <input id="jumpUser" class="settings-input" type="text" [(ngModel)]="connectionForm.jumpUser" placeholder="username" />
+              </div>
+              <div class="settings-section" *ngIf="connectionForm.authMethod === 'password'">
+                <label class="settings-label" for="jumpPassword">Password</label>
+                <input id="jumpPassword" class="settings-input password-input" type="password" [(ngModel)]="connectionForm.jumpPassword" />
+              </div>
+            </div>
+          </div>
+
+          <div class="connection-section">
+            <div class="connection-section-title">Target Server</div>
+            <div class="connection-form-grid">
+              <div class="settings-section">
+                <label class="settings-label" for="targetHost">Host</label>
+                <input id="targetHost" class="settings-input" type="text" [(ngModel)]="connectionForm.targetHost" placeholder="192.168.23.110" />
+              </div>
+              <div class="settings-section">
+                <label class="settings-label" for="targetPort">Port</label>
+                <input id="targetPort" class="settings-input" type="number" min="1" [(ngModel)]="connectionForm.targetPort" placeholder="22" />
+              </div>
+              <div class="settings-section">
+                <label class="settings-label" for="targetUser">User</label>
+                <input id="targetUser" class="settings-input" type="text" [(ngModel)]="connectionForm.targetUser" placeholder="root" />
+              </div>
+              <div class="settings-section" *ngIf="connectionForm.authMethod === 'password'">
+                <label class="settings-label" for="targetPassword">Password</label>
+                <input id="targetPassword" class="settings-input password-input" type="password" [(ngModel)]="connectionForm.targetPassword" />
+              </div>
+              <div class="settings-section connection-form-wide" *ngIf="connectionForm.authMethod === 'privateKey'">
+                <label class="settings-label" for="privateKeyPath">Private Key Path</label>
+                <input id="privateKeyPath" class="settings-input" type="text" [(ngModel)]="connectionForm.privateKeyPath" placeholder="~/.ssh/id_rsa" />
+              </div>
+            </div>
+          </div>
+
+          <div class="connection-section">
+            <div class="connection-section-header">
+              <div class="connection-section-title">Auto Input Rules</div>
+              <button class="settings-button" type="button" (click)="addAutoInputRule()">Add Rule</button>
+            </div>
+            <div class="auto-rule-list" *ngIf="connectionForm.autoInputRules.length > 0">
+              <div class="auto-rule-row" *ngFor="let rule of connectionForm.autoInputRules; trackBy: trackByAutoInputRuleId">
+                <label class="auto-rule-toggle">
+                  <input type="checkbox" [(ngModel)]="rule.enabled" />
+                  Enabled
+                </label>
+                <input class="settings-input" type="text" [(ngModel)]="rule.whenOutputMatches" placeholder="Output contains or regex" />
+                <input class="settings-input" type="text" [(ngModel)]="rule.input" placeholder="Input to send" />
+                <label class="auto-rule-toggle">
+                  <input type="checkbox" [(ngModel)]="rule.appendEnter" />
+                  Enter
+                </label>
+                <button class="settings-button danger" type="button" (click)="removeAutoInputRule(rule.id)">Remove</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label class="settings-label" for="connectionDescription">Description</label>
+            <textarea id="connectionDescription" class="settings-textarea" [(ngModel)]="connectionForm.description" rows="3"></textarea>
+          </div>
+
+          <div class="settings-actions">
+            <button class="settings-button primary" type="button" (click)="saveConnectionProfile()">
+              {{ connectionFormMode === 'edit' ? 'Save Changes' : 'Create Profile' }}
+            </button>
+            <button class="settings-button" type="button" (click)="closeConnectionForm()">
+              Cancel
+            </button>
+          </div>
+
+          <div class="settings-status" *ngIf="connectionStatus">
+            {{ connectionStatus }}
+          </div>
         </div>
       </div>
     </div>

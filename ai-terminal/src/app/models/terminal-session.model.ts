@@ -9,4 +9,5 @@ export interface TerminalSession {
   gitBranch: string;
   isSshSessionActive: boolean;
   currentSshUserHost: string | null;
+  connectionProfileId?: string;
 }

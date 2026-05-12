@@ -17,7 +17,8 @@ export class TerminalSessionService {
   createNewSession(
     sessions: TerminalSession[],
     name?: string,
-    setAsActive: boolean = false
+    setAsActive: boolean = false,
+    connectionProfileId?: string
   ): { sessions: TerminalSession[]; sessionId: string; shouldActivate: boolean } {
     const sessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const sessionName = name || `Terminal ${sessions.length + 1}`;
@@ -30,7 +31,8 @@ export class TerminalSessionService {
       isActive: false,
       gitBranch: '',
       isSshSessionActive: false,
-      currentSshUserHost: null
+      currentSshUserHost: null,
+      connectionProfileId
     };
 
     const nextSessions = [...sessions, newSession];
