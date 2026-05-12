@@ -1,4 +1,4 @@
-<div class="tab" [class.active]="session.isActive" (click)="onSelect()">
+<div class="tab" [class.active]="session.isActive" [attr.data-session-id]="session.id" (click)="onSelect()">
   <span
     class="tab-name"
   >

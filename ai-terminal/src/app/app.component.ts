@@ -64,8 +64,20 @@ interface ActiveConnectionRuntime {
   profileId: string;
   profileType: ConnectionProfileType;
   passwordAttempted: boolean;
+  pendingAutoInputRuleIds: string[];
   firedAutoInputRuleIds: string[];
   createdAt: string;
+}
+
+interface CurrentConnectionContext {
+  terminalSessionId: string;
+  profileId: string;
+  profileType: ConnectionProfileType;
+  displayName: string;
+  targetHost?: string;
+  targetUser?: string;
+  jumpHost?: string;
+  jumpUser?: string;
 }
 
 @Component({
@@ -119,6 +131,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   // Auto-scroll
   @ViewChild('terminalContainer') terminalContainerRef!: ElementRef<HTMLDivElement>;
+  @ViewChild('tabsScrollArea') tabsScrollAreaRef?: ElementRef<HTMLDivElement>;
   private terminal: Terminal | null = null;
   private fitAddon: FitAddon | null = null;
   private ptySessions = new Set<string>();
@@ -126,6 +139,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private ptySessionPromises = new Map<string, Promise<void>>();
   private ptyBufferBySession = new Map<string, string>();
   private activeConnectionRuntimes = new Map<string, ActiveConnectionRuntime>();
+  private isRenderingPtyBuffer = false;
   private _shouldScroll = false;
   private scrollFramePending = false;
   get shouldScroll(): boolean {
@@ -271,15 +285,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.open(this.terminalContainerRef.nativeElement);
     this.fitAddon.fit();
+    this.registerTerminalClipboardShortcuts();
 
     this.terminal.onData((data: string) => {
-      if (!this.activeSessionId) {
-        return;
-      }
-      invoke<void>('pty_write', { sessionId: this.activeSessionId, data })
-        .catch((error) => {
-          console.error('Failed to write to PTY:', error);
-        });
+      this.writeToActivePty(data);
     });
 
     this.terminal.onResize(({ cols, rows }) => {
@@ -296,6 +305,69 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (this.activeSessionId) {
       void this.ensurePtySession(this.activeSessionId);
     }
+  }
+
+  private registerTerminalClipboardShortcuts(): void {
+    if (!this.terminal) {
+      return;
+    }
+
+    this.terminal.attachCustomKeyEventHandler((event: KeyboardEvent) => {
+      if (event.type !== 'keydown' || (!event.ctrlKey && !event.metaKey)) {
+        return true;
+      }
+
+      const key = event.key.toLowerCase();
+      if (key === 'c') {
+        event.preventDefault();
+        this.copyTerminalSelectionOrInterrupt();
+        return false;
+      }
+
+      if (key === 'v') {
+        event.preventDefault();
+        void this.pasteClipboardToTerminal();
+        return false;
+      }
+
+      return true;
+    });
+  }
+
+  private copyTerminalSelectionOrInterrupt(): void {
+    if (!this.terminal) {
+      return;
+    }
+
+    const selection = this.terminal.hasSelection() ? this.terminal.getSelection() : '';
+    if (selection) {
+      void this.copyToClipboard(selection);
+      return;
+    }
+
+    this.writeToActivePty('\x03');
+  }
+
+  private async pasteClipboardToTerminal(): Promise<void> {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        this.writeToActivePty(text);
+      }
+    } catch (error) {
+      console.error('Failed to paste clipboard text to terminal:', error);
+    }
+  }
+
+  private writeToActivePty(data: string): void {
+    if (!this.activeSessionId || this.isRenderingPtyBuffer) {
+      return;
+    }
+
+    invoke<void>('pty_write', { sessionId: this.activeSessionId, data })
+      .catch((error) => {
+        console.error('Failed to write to PTY:', error);
+      });
   }
 
   private async registerPtyListeners(): Promise<void> {
@@ -361,10 +433,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     const sessionBuffer = this.ptyBufferBySession.get(this.activeSessionId) || '';
+    this.isRenderingPtyBuffer = true;
     this.terminal.reset();
     if (sessionBuffer.length > 0) {
-      this.terminal.write(sessionBuffer);
+      this.terminal.write(sessionBuffer, () => {
+        this.isRenderingPtyBuffer = false;
+      });
+      return;
     }
+
+    queueMicrotask(() => {
+      this.isRenderingPtyBuffer = false;
+    });
   }
 
   private resizeInteractiveTerminal(): void {
@@ -936,11 +1016,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   async connectConnectionProfile(profile: ConnectionProfile): Promise<void> {
-    if (profile.type !== 'ssh') {
-      this.connectionStatus = 'JumpServer connection will be implemented in task 04.';
-      return;
-    }
-
     const displayName = this.generateConnectionDisplayName(profile);
     let sessionId = '';
 
@@ -978,6 +1053,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       profileId: profile.id,
       profileType: profile.type,
       passwordAttempted: false,
+      pendingAutoInputRuleIds: [],
       firedAutoInputRuleIds: [],
       createdAt: new Date().toISOString()
     });
@@ -990,6 +1066,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     await this.handlePasswordPromptAutomation(runtime);
+    await this.handleJumpServerAutoInputRules(runtime);
   }
 
   private async handlePasswordPromptAutomation(runtime: ActiveConnectionRuntime): Promise<void> {
@@ -1025,7 +1102,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   private getConnectionPassword(profile: ConnectionProfile): string | undefined {
     if (profile.type === 'jumpserver') {
-      return profile.jumpPassword || profile.targetPassword;
+      return profile.jumpPassword;
     }
 
     return profile.targetPassword;
@@ -1037,13 +1114,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private hasPasswordPrompt(output: string): boolean {
-    const normalizedOutput = output
-      .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
-      .replace(/\u0007/g, '');
+    const normalizedOutput = this.normalizeTerminalOutput(output);
     return /(?:password|passphrase|密码)[^:\n\r]*[:：][\s\u0000-\u001f]*$/i.test(normalizedOutput);
   }
 
   buildSshCommand(profile: ConnectionProfile): string {
+    if (profile.type === 'jumpserver') {
+      return this.buildJumpServerSshCommand(profile);
+    }
+
+    return this.buildTargetSshCommand(profile);
+  }
+
+  private buildTargetSshCommand(profile: ConnectionProfile): string {
     const host = profile.targetHost?.trim();
     if (!host) {
       throw new Error('Target host is required for SSH connections.');
@@ -1061,6 +1144,98 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const user = profile.targetUser?.trim();
     commandParts.push(user ? `${user}@${host}` : host);
     return commandParts.join(' ');
+  }
+
+  private buildJumpServerSshCommand(profile: ConnectionProfile): string {
+    const host = profile.jumpHost?.trim();
+    if (!host) {
+      throw new Error('JumpServer host is required for JumpServer connections.');
+    }
+
+    const commandParts = ['ssh'];
+    if (profile.authMethod === 'privateKey' && profile.privateKeyPath?.trim()) {
+      commandParts.push('-i', this.quoteShellArg(profile.privateKeyPath.trim()));
+    }
+
+    if (profile.jumpPort) {
+      commandParts.push('-p', String(profile.jumpPort));
+    }
+
+    const user = profile.jumpUser?.trim();
+    commandParts.push(user ? `${user}@${host}` : host);
+    return commandParts.join(' ');
+  }
+
+  private async handleJumpServerAutoInputRules(runtime: ActiveConnectionRuntime): Promise<void> {
+    if (runtime.profileType !== 'jumpserver') {
+      return;
+    }
+
+    const profile = this.connectionProfileService.getProfile(runtime.profileId);
+    if (!profile) {
+      return;
+    }
+
+    const outputTail = this.getPtyOutputTail(runtime.terminalSessionId);
+    const enabledRules = profile.autoInputRules.filter((rule) => rule.enabled);
+    for (const rule of enabledRules) {
+      if (runtime.firedAutoInputRuleIds.includes(rule.id) || runtime.pendingAutoInputRuleIds.includes(rule.id)) {
+        continue;
+      }
+
+      if (!this.doesAutoInputRuleMatch(rule, outputTail)) {
+        continue;
+      }
+
+      const input = this.getAutoInputValue(rule, profile);
+      if (!input) {
+        continue;
+      }
+
+      runtime.pendingAutoInputRuleIds.push(rule.id);
+      try {
+        await invoke<void>('pty_write', {
+          sessionId: runtime.terminalSessionId,
+          data: rule.appendEnter ? this.withTerminalSubmitSequence(input) : input
+        });
+        runtime.firedAutoInputRuleIds.push(rule.id);
+      } catch (error) {
+        console.error(`Failed to submit JumpServer auto input for session ${runtime.terminalSessionId}:`, error);
+      } finally {
+        runtime.pendingAutoInputRuleIds = runtime.pendingAutoInputRuleIds.filter(
+          (pendingRuleId) => pendingRuleId !== rule.id
+        );
+      }
+    }
+  }
+
+  private doesAutoInputRuleMatch(rule: AutoInputRule, output: string): boolean {
+    const pattern = rule.whenOutputMatches.trim();
+    if (!pattern) {
+      return false;
+    }
+
+    const normalizedOutput = this.normalizeTerminalOutput(output);
+    try {
+      return new RegExp(pattern).test(normalizedOutput);
+    } catch {
+      return normalizedOutput.includes(pattern);
+    }
+  }
+
+  private getAutoInputValue(rule: AutoInputRule, profile: ConnectionProfile): string {
+    const configuredInput = rule.input.trim();
+    if (configuredInput) {
+      return configuredInput;
+    }
+
+    return profile.targetHost?.trim() || '';
+  }
+
+  private normalizeTerminalOutput(output: string): string {
+    return output
+      .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+      .replace(/\u0007/g, '');
   }
 
   private quoteShellArg(value: string): string {
@@ -1125,6 +1300,35 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   getConnectionTypeLabel(type: ConnectionProfileType): string {
     return type === 'jumpserver' ? 'JumpServer' : 'SSH';
+  }
+
+  getCurrentConnectionContext(sessionId: string = this.activeSessionId): CurrentConnectionContext | undefined {
+    if (!sessionId) {
+      return undefined;
+    }
+
+    const runtime = this.activeConnectionRuntimes.get(sessionId);
+    const sessionProfileId = this.terminalSessions.find((session) => session.id === sessionId)?.connectionProfileId;
+    const profileId = runtime?.profileId || sessionProfileId;
+    if (!profileId) {
+      return undefined;
+    }
+
+    const profile = this.connectionProfileService.getProfile(profileId);
+    if (!profile) {
+      return undefined;
+    }
+
+    return {
+      terminalSessionId: sessionId,
+      profileId: profile.id,
+      profileType: profile.type,
+      displayName: this.generateConnectionDisplayName(profile),
+      targetHost: profile.targetHost,
+      targetUser: profile.targetUser,
+      jumpHost: profile.jumpHost,
+      jumpUser: profile.jumpUser
+    };
   }
 
   formatConnectionTime(value?: string): string {
@@ -1328,6 +1532,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   switchToSession(sessionId: string): void {
+    if (sessionId === this.activeSessionId) {
+      this.scrollSessionTabIntoView(sessionId);
+      this.focusTerminalInput();
+      return;
+    }
+
     // Save current session state
     if (this.activeSessionId) {
       this.saveCurrentSessionState();
@@ -1344,6 +1554,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     this.activeSessionId = sessionId;
+    this.scrollSessionTabIntoView(sessionId);
 
     // Restore session state
     this.restoreSessionState(targetSession);
@@ -1355,6 +1566,38 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         console.error(`Failed to initialize PTY for ${sessionId}:`, error);
       });
     }
+  }
+
+  private scrollSessionTabIntoView(sessionId: string): void {
+    requestAnimationFrame(() => {
+      const scrollArea = this.tabsScrollAreaRef?.nativeElement;
+      if (!scrollArea) {
+        return;
+      }
+
+      const tab = scrollArea.querySelector<HTMLElement>(
+        `[data-session-id="${CSS.escape(sessionId)}"]`
+      );
+      if (!tab) {
+        return;
+      }
+
+      const scrollRect = scrollArea.getBoundingClientRect();
+      const tabRect = tab.getBoundingClientRect();
+      let nextScrollLeft = scrollArea.scrollLeft;
+
+      if (tabRect.right > scrollRect.right) {
+        nextScrollLeft += tabRect.right - scrollRect.right + 8;
+      } else if (tabRect.left < scrollRect.left) {
+        nextScrollLeft -= scrollRect.left - tabRect.left + 8;
+      }
+
+      const maxScrollLeft = scrollArea.scrollWidth - scrollArea.clientWidth;
+      scrollArea.scrollTo({
+        left: Math.min(Math.max(nextScrollLeft, 0), maxScrollLeft),
+        behavior: 'smooth'
+      });
+    });
   }
 
   closeSession(sessionId: string): void {

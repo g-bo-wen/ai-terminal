@@ -5,15 +5,14 @@
 .tab {
   display: flex;
   align-items: center;
+  flex: 0 0 auto;
   padding: 5px 10px;
-  margin-right: 6px;
   background-color: transparent;
   border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 6px;
   cursor: pointer;
   transition: all 0.2s ease;
-  min-width: 100px;
-  max-width: 200px;
+  min-width: max-content;
   position: relative;
   font-size: 12px;
   height: 24px;
@@ -39,10 +38,9 @@
 }
 
 .tab-name {
-  flex: 1;
+  flex: 0 0 auto;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
   color: #9ba7b4;
   font-size: 12px;
   line-height: 1;

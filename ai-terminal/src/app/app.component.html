@@ -4,14 +4,18 @@
     <div class="panel-content">
       <!-- Terminal Tabs -->
       <div class="terminal-tabs">
-        <div class="tabs-container">
-          <app-terminal-tab
-            *ngFor="let session of terminalSessions; trackBy: trackBySessionId"
-            [session]="session"
-            [canClose]="terminalSessions.length > 1"
-            (select)="switchToSession($event)"
-            (close)="closeSession($event)"
-          ></app-terminal-tab>
+        <div class="tabs-scroll-area" #tabsScrollArea>
+          <div class="tabs-container">
+            <app-terminal-tab
+              *ngFor="let session of terminalSessions; trackBy: trackBySessionId"
+              [session]="session"
+              [canClose]="terminalSessions.length > 1"
+              (select)="switchToSession($event)"
+              (close)="closeSession($event)"
+            ></app-terminal-tab>
+          </div>
+        </div>
+        <div class="terminal-toolbar">
           <button class="new-tab" (click)="createNewSession(undefined, true)" title="New tab">
             +
           </button>
@@ -20,13 +24,15 @@
             type="button"
             (click)="openConnectionManager()"
             title="Manage connection profiles"
+            aria-label="Manage connection profiles"
           >
-            Connection
+            <app-icon name="connection" [size]="16"></app-icon>
           </button>
           <button
             class="ai-panel-toggle"
             (click)="toggleAIPanel()"
             [title]="isAIPanelVisible ? 'Hide AI panel' : 'Show AI panel'"
+            [attr.aria-label]="isAIPanelVisible ? 'Hide AI panel' : 'Show AI panel'"
           >
             <app-icon [name]="isAIPanelVisible ? 'ai-panel-visible' : 'ai-panel-hidden'" [size]="16"></app-icon>
           </button>
@@ -283,7 +289,12 @@
 
             <div class="settings-section">
               <label class="settings-label" for="connectionType">Type</label>
-              <select id="connectionType" class="settings-input" [(ngModel)]="connectionForm.type">
+              <select
+                id="connectionType"
+                class="settings-input"
+                [(ngModel)]="connectionForm.type"
+                [disabled]="connectionFormMode === 'edit'"
+              >
                 <option value="ssh">SSH</option>
                 <option value="jumpserver">JumpServer</option>
               </select>
@@ -327,7 +338,7 @@
             </div>
           </div>
 
-          <div class="connection-section">
+          <div class="connection-section" *ngIf="connectionForm.type === 'ssh'">
             <div class="connection-section-title">Target Server</div>
             <div class="connection-form-grid">
               <div class="settings-section">
