@@ -1,6 +1,7 @@
 import { Injectable } from '@angular/core';
 import { CommandHistory } from '../models/command-history.model';
 import { TerminalSession } from '../models/terminal-session.model';
+import { TerminalProfileKind } from '../models/terminal-profile.model';
 
 export interface TerminalRuntimeState {
   commandHistory: CommandHistory[];
@@ -18,7 +19,9 @@ export class TerminalSessionService {
     sessions: TerminalSession[],
     name?: string,
     setAsActive: boolean = false,
-    connectionProfileId?: string
+    connectionProfileId?: string,
+    terminalKind?: TerminalProfileKind,
+    wslDistroName?: string
   ): { sessions: TerminalSession[]; sessionId: string; shouldActivate: boolean } {
     const sessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const sessionName = name || `Terminal ${sessions.length + 1}`;
@@ -32,7 +35,9 @@ export class TerminalSessionService {
       gitBranch: '',
       isSshSessionActive: false,
       currentSshUserHost: null,
-      connectionProfileId
+      connectionProfileId,
+      terminalKind,
+      wslDistroName
     };
 
     const nextSessions = [...sessions, newSession];

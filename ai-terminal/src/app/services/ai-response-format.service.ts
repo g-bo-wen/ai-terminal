@@ -187,12 +187,7 @@ export class AiResponseFormatService {
       return null;
     }
 
-    const parts = code.split(':');
-    if (parts.length > 1 && parts[1].trim()) {
-      return parts.slice(1).join(':').trim();
-    }
-
-    return null;
+    return this.splitCommandAndExplanation(code).explanation;
   }
 
   transformCodeForDisplay(code: string): string {
@@ -200,13 +195,77 @@ export class AiResponseFormatService {
       return '';
     }
 
+    return this.splitCommandAndExplanation(code).command;
+  }
+
+  private splitCommandAndExplanation(code: string): { command: string; explanation: string | null } {
     let cleanCode = code.replace(/```/g, '').trim();
-    const colonIndex = cleanCode.indexOf(':');
-    if (colonIndex > -1) {
-      cleanCode = cleanCode.substring(0, colonIndex).trim();
+    const lines = cleanCode.split('\n');
+    if (lines.length > 1 && this.isLikelyCodeFenceLanguage(lines[0])) {
+      cleanCode = lines.slice(1).join('\n').trim();
     }
 
-    return cleanCode;
+    const separatorIndex = this.findInlineExplanationSeparator(cleanCode);
+    if (separatorIndex < 0) {
+      return { command: cleanCode, explanation: null };
+    }
+
+    const command = cleanCode.slice(0, separatorIndex).trim();
+    const explanation = cleanCode.slice(separatorIndex + 1).trim();
+    return {
+      command: command || cleanCode,
+      explanation: command && explanation ? explanation : null
+    };
+  }
+
+  private findInlineExplanationSeparator(value: string): number {
+    let quote: string | null = null;
+    let escaped = false;
+
+    for (let index = 0; index < value.length; index += 1) {
+      const char = value[index];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (quote) {
+        if (char === quote) {
+          quote = null;
+        }
+        continue;
+      }
+
+      if (char === '\'' || char === '"' || char === '`') {
+        quote = char;
+        continue;
+      }
+
+      if (char !== ':' && char !== '：') {
+        continue;
+      }
+
+      const previousChar = value[index - 1] || '';
+      const nextChar = value[index + 1] || '';
+      if (!previousChar || /\s/.test(previousChar) || !nextChar || !/\s/.test(nextChar)) {
+        continue;
+      }
+
+      return index;
+    }
+
+    return -1;
+  }
+
+  private isLikelyCodeFenceLanguage(value: string): boolean {
+    const language = value.trim();
+    return /^[A-Za-z][A-Za-z0-9_-]{0,19}$/.test(language);
   }
 
   private processSingleBackticks(text: string): string {

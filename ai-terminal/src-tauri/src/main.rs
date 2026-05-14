@@ -30,6 +30,8 @@ fn main() {
             command::core::pty::pty_resize,
             command::core::pty::pty_close_session,
             utils::operating_system_utils::get_current_pid,
+            utils::operating_system_utils::list_wsl_distributions,
+            utils::server_context_utils::save_server_context_file,
             command::autocomplete::autocomplete_command::autocomplete,
             utils::file_system_utils::get_working_directory,
             utils::file_system_utils::get_home_directory,

@@ -215,6 +215,10 @@ export class ConnectionProfileService {
       autoInputRules: this.normalizeAutoInputRules(value['autoInputRules']),
       tags: this.normalizeTags(value['tags']),
       description: this.normalizeOptionalString(value['description']),
+      serverContext: this.normalizeOptionalRawString(value['serverContext']),
+      serverContextPath: this.normalizeOptionalString(value['serverContextPath']),
+      probeRawOutput: this.normalizeOptionalRawString(value['probeRawOutput']),
+      probeUpdatedAt: this.normalizeOptionalString(value['probeUpdatedAt']),
       lastConnectedAt: this.normalizeOptionalString(value['lastConnectedAt']),
       createdAt: this.normalizeOptionalString(value['createdAt']) || timestamp,
       updatedAt: this.normalizeOptionalString(value['updatedAt']) || timestamp

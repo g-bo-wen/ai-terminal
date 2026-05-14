@@ -27,6 +27,10 @@ export interface ConnectionProfile {
   autoInputRules: AutoInputRule[];
   tags: string[];
   description?: string;
+  serverContext?: string;
+  serverContextPath?: string;
+  probeRawOutput?: string;
+  probeUpdatedAt?: string;
   lastConnectedAt?: string;
   createdAt: string;
   updatedAt: string;

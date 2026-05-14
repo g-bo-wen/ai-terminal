@@ -1,4 +1,5 @@
 import { CommandHistory } from './command-history.model';
+import { TerminalProfileKind } from './terminal-profile.model';
 
 export interface TerminalSession {
   id: string;
@@ -10,4 +11,6 @@ export interface TerminalSession {
   isSshSessionActive: boolean;
   currentSshUserHost: string | null;
   connectionProfileId?: string;
+  terminalKind?: TerminalProfileKind;
+  wslDistroName?: string;
 }

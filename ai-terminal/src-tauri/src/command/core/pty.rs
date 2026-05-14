@@ -27,6 +27,8 @@ pub fn pty_create_session(
     session_id: String,
     cols: u16,
     rows: u16,
+    launch_kind: Option<String>,
+    wsl_distro_name: Option<String>,
     app_handle: AppHandle,
     pty_manager: State<'_, PtyManager>,
 ) -> Result<(), String> {
@@ -40,7 +42,7 @@ pub fn pty_create_session(
         })
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
-    let mut command = new_platform_pty_command();
+    let mut command = new_platform_pty_command(launch_kind.as_deref(), wsl_distro_name.as_deref());
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
 
@@ -189,7 +191,16 @@ pub fn pty_create_session(
 }
 
 #[cfg(target_os = "windows")]
-fn new_platform_pty_command() -> CommandBuilder {
+fn new_platform_pty_command(launch_kind: Option<&str>, wsl_distro_name: Option<&str>) -> CommandBuilder {
+    if launch_kind == Some("local-wsl") {
+        let mut command = CommandBuilder::new("wsl.exe");
+        if let Some(distro_name) = wsl_distro_name.filter(|value| !value.trim().is_empty()) {
+            command.arg("-d");
+            command.arg(distro_name.trim());
+        }
+        return command;
+    }
+
     let mut command = CommandBuilder::new("powershell.exe");
     command.arg("-NoLogo");
     command.arg("-NoProfile");
@@ -198,12 +209,19 @@ fn new_platform_pty_command() -> CommandBuilder {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn new_platform_pty_command() -> CommandBuilder {
-    // Prefer a clean bash session for embedded PTY stability.
-    // This avoids shell theme artifacts and prompt control sequences.
-    let preferred_bash = "/bin/bash";
-    let shell = if Path::new(preferred_bash).exists() {
-        preferred_bash.to_string()
+fn new_platform_pty_command(launch_kind: Option<&str>, _wsl_distro_name: Option<&str>) -> CommandBuilder {
+    #[cfg(target_os = "macos")]
+    let default_shell = "/bin/zsh";
+    #[cfg(not(target_os = "macos"))]
+    let default_shell = "/bin/bash";
+
+    let preferred_shell = if launch_kind == Some("local-zsh") {
+        "/bin/zsh"
+    } else {
+        default_shell
+    };
+    let shell = if Path::new(preferred_shell).exists() {
+        preferred_shell.to_string()
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
     };

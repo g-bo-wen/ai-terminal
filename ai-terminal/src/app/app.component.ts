@@ -15,7 +15,10 @@ import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { CommandHistory } from './models/command-history.model';
+import { AiCodeBlock, AiConversation, AiMessage } from './models/ai-conversation.model';
 import { ChatHistory } from './models/chat-history.model';
+import { CommandExecution } from './models/command-execution.model';
+import { CommandSuggestion } from './models/command-suggestion.model';
 import {
   AutoInputRule,
   ConnectionAuthMethod,
@@ -25,14 +28,23 @@ import {
   UpdateConnectionProfilePatch
 } from './models/connection-profile.model';
 import { TerminalSession } from './models/terminal-session.model';
+import {
+  TerminalProfileKind,
+  TerminalProfileViewItem,
+  WslDistribution
+} from './models/terminal-profile.model';
 import { TerminalTabComponent } from './components/terminal-tab/terminal-tab.component';
 import { IconComponent } from './components/icon/icon.component';
 import { AiCommandService } from './services/ai-command.service';
+import { AiConversationService } from './services/ai-conversation.service';
 import { AiResponseFormatService } from './services/ai-response-format.service';
 import { ConnectionProfileService } from './services/connection-profile.service';
 import { OpenAiCompatibleConnectionService } from './services/open-ai-compatible-connection.service';
 import { TerminalSessionService } from './services/terminal-session.service';
-import { buildTerminalAssistantSystemPrompt } from './constants/ai.constants';
+import {
+  buildTerminalAssistantSystemPrompt,
+  TerminalAssistantEnvironmentContext
+} from './constants/ai.constants';
 
 interface StoredAiSettings {
   apiBaseUrl?: string;
@@ -57,12 +69,17 @@ interface ConnectionProfileForm {
   autoInputRules: AutoInputRule[];
   tagsText: string;
   description: string;
+  serverContext: string;
+  serverContextPath: string;
+  probeRawOutput: string;
+  probeUpdatedAt: string;
 }
 
 interface ActiveConnectionRuntime {
   terminalSessionId: string;
   profileId: string;
   profileType: ConnectionProfileType;
+  profileSnapshot?: ConnectionProfile;
   passwordAttempted: boolean;
   pendingAutoInputRuleIds: string[];
   firedAutoInputRuleIds: string[];
@@ -78,6 +95,36 @@ interface CurrentConnectionContext {
   targetUser?: string;
   jumpHost?: string;
   jumpUser?: string;
+}
+
+interface CommandExplanationTurn {
+  role: 'user' | 'assistant';
+  content: string;
+  createdAt: string;
+}
+
+interface CommandExplanationState {
+  suggestionId: string;
+  isOpen: boolean;
+  isLoading: boolean;
+  followUpQuestion: string;
+  turns: CommandExplanationTurn[];
+  error?: string;
+}
+
+interface ExecuteTerminalCommandOptions {
+  suggestion?: CommandSuggestion;
+}
+
+interface RunningExecutionState {
+  executionId: string;
+  terminalSessionId: string;
+  command: string;
+  wrappedCommand: string;
+  markerId: string;
+  startMarker: string;
+  doneMarker: string;
+  outputBuffer: string;
 }
 
 @Component({
@@ -99,9 +146,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   gitBranch: string = '';
 
   // AI Chat properties
-  chatHistory: ChatHistory[] = [];
+  aiConversations: AiConversation[] = [];
+  activeAiConversation?: AiConversation;
+  activeAiConversationId: string = '';
   currentQuestion: string = '';
   isProcessingAI: boolean = false;
+  commandExplanationStates: Record<string, CommandExplanationState> = {};
   isAIPanelVisible: boolean = true;
   activeAiView: 'chat' | 'settings' = 'chat';
   aiApiBaseUrl: string = 'https://api.openai.com/v1';
@@ -110,6 +160,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   availableModels: string[] = [];
   aiSettingsStatus: string = '';
   isLoadingModels: boolean = false;
+  copyToastMessage: string = '';
+  isCopyToastVisible: boolean = false;
 
   // Connection profile properties
   connectionProfiles: ConnectionProfile[] = [];
@@ -118,6 +170,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   connectionStatus: string = '';
   isConnectionManagerOpen: boolean = false;
   isConnectionFormOpen: boolean = false;
+  isTerminalLauncherOpen: boolean = false;
+  wslDistributions: WslDistribution[] = [];
+  isLoadingTerminalProfiles: boolean = false;
+  terminalProfilesStatus: string = '';
+  isProbingConnectionProfile: boolean = false;
+  probeStatus: string = '';
   connectionForm: ConnectionProfileForm = this.createEmptyConnectionForm();
 
   // Resizing properties
@@ -138,7 +196,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private pendingPtySessions = new Set<string>();
   private ptySessionPromises = new Map<string, Promise<void>>();
   private ptyBufferBySession = new Map<string, string>();
+  private pendingPtyInputBySession = new Map<string, string>();
+  private ptyInputFlushPromises = new Map<string, Promise<void>>();
+  private runningExecutionStatesBySession = new Map<string, RunningExecutionState>();
+  private pendingMacShiftPrintableKeypress: string | null = null;
   private activeConnectionRuntimes = new Map<string, ActiveConnectionRuntime>();
+  private aiAbortController: AbortController | null = null;
+  private commandExplanationAbortControllers = new Map<string, AbortController>();
+  private copyToastTimeoutId?: number;
+  private wslDistributionsLoaded = false;
+  private wslDistributionsLoadPromise: Promise<void> | null = null;
+  private lastWslDistributionsLoadAttemptAt = 0;
   private isRenderingPtyBuffer = false;
   private _shouldScroll = false;
   private scrollFramePending = false;
@@ -160,6 +228,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   constructor(
     private sanitizer: DomSanitizer,
     private aiCommandService: AiCommandService,
+    private aiConversationService: AiConversationService,
     private aiResponseFormatService: AiResponseFormatService,
     private connectionProfileService: ConnectionProfileService,
     private openAiConnectionService: OpenAiCompatibleConnectionService,
@@ -249,10 +318,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.loadConnectionProfiles();
 
     // Initialize first terminal session
-    this.createNewSession('Terminal 1', true);
+    const defaultTerminalKind = this.getDefaultTerminalKind();
+    this.createNewSession(
+      this.getDefaultTerminalName(defaultTerminalKind),
+      true,
+      undefined,
+      defaultTerminalKind
+    );
 
     // Clean any existing code blocks to ensure no backticks are displayed
     this.sanitizeAllCodeBlocks();
+    this.syncAiConversationState();
   }
 
   ngAfterViewInit(): void {
@@ -286,6 +362,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.terminal.open(this.terminalContainerRef.nativeElement);
     this.fitAddon.fit();
     this.registerTerminalClipboardShortcuts();
+    this.focusTerminalInput();
 
     this.terminal.onData((data: string) => {
       this.writeToActivePty(data);
@@ -313,6 +390,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     this.terminal.attachCustomKeyEventHandler((event: KeyboardEvent) => {
+      if (this.handleMacShiftPrintableKey(event)) {
+        return false;
+      }
+
       if (event.type !== 'keydown' || (!event.ctrlKey && !event.metaKey)) {
         return true;
       }
@@ -332,6 +413,42 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       return true;
     });
+  }
+
+  private handleMacShiftPrintableKey(event: KeyboardEvent): boolean {
+    if (event.type === 'keypress' && this.pendingMacShiftPrintableKeypress) {
+      if (event.key === this.pendingMacShiftPrintableKeypress) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.pendingMacShiftPrintableKeypress = null;
+        return true;
+      }
+      this.pendingMacShiftPrintableKeypress = null;
+    }
+
+    if (
+      event.type !== 'keydown' ||
+      this.detectOperatingSystem() !== 'macOS' ||
+      !event.shiftKey ||
+      event.ctrlKey ||
+      event.altKey ||
+      event.metaKey ||
+      event.isComposing ||
+      event.key.length !== 1 ||
+      !this.isShiftPrintableFallbackKey(event.key)
+    ) {
+      return false;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    this.pendingMacShiftPrintableKeypress = event.key;
+    this.writeToActivePty(event.key);
+    return true;
+  }
+
+  private isShiftPrintableFallbackKey(key: string): boolean {
+    return /^[\x20-\x7E]$/.test(key) && !/^[A-Za-z]$/.test(key);
   }
 
   private copyTerminalSelectionOrInterrupt(): void {
@@ -360,27 +477,91 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private writeToActivePty(data: string): void {
-    if (!this.activeSessionId || this.isRenderingPtyBuffer) {
+    if (!this.activeSessionId || !data) {
       return;
     }
 
-    invoke<void>('pty_write', { sessionId: this.activeSessionId, data })
-      .catch((error) => {
+    void this.writeToPtySession(this.activeSessionId, data);
+  }
+
+  private async writeToPtySession(sessionId: string, data: string): Promise<void> {
+    if (!data) {
+      return;
+    }
+
+    this.enqueuePtyInput(sessionId, data);
+    await this.flushPendingPtyInput(sessionId);
+  }
+
+  private enqueuePtyInput(sessionId: string, data: string): void {
+    const pendingInput = this.pendingPtyInputBySession.get(sessionId) || '';
+    this.pendingPtyInputBySession.set(sessionId, pendingInput + data);
+  }
+
+  private async flushPendingPtyInput(sessionId: string): Promise<void> {
+    const existingFlush = this.ptyInputFlushPromises.get(sessionId);
+    if (existingFlush) {
+      return existingFlush;
+    }
+
+    const flushPromise = this.flushPendingPtyInputLoop(sessionId).finally(() => {
+      this.ptyInputFlushPromises.delete(sessionId);
+    });
+    this.ptyInputFlushPromises.set(sessionId, flushPromise);
+    return flushPromise;
+  }
+
+  private async flushPendingPtyInputLoop(sessionId: string): Promise<void> {
+    while (this.pendingPtyInputBySession.has(sessionId)) {
+      if (this.isRenderingPtyBuffer && sessionId === this.activeSessionId) {
+        await this.waitForNextAnimationFrame();
+        continue;
+      }
+
+      await this.ensurePtySession(sessionId);
+      if (!this.ptySessions.has(sessionId)) {
+        return;
+      }
+
+      const data = this.pendingPtyInputBySession.get(sessionId) || '';
+      this.pendingPtyInputBySession.delete(sessionId);
+      if (!data) {
+        continue;
+      }
+
+      try {
+        await invoke<void>('pty_write', { sessionId, data });
+      } catch (error) {
+        this.pendingPtyInputBySession.set(
+          sessionId,
+          data + (this.pendingPtyInputBySession.get(sessionId) || '')
+        );
         console.error('Failed to write to PTY:', error);
-      });
+        return;
+      }
+    }
+  }
+
+  private waitForNextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
   }
 
   private async registerPtyListeners(): Promise<void> {
     const unlistenPtyOutput = await listen('pty_output', (event) => {
       const payload = event.payload as { sessionId: string; data: string };
+      const displayData = this.filterRunningExecutionDisplayOutput(payload.sessionId, payload.data);
+
+      this.captureRunningExecutionOutput(payload.sessionId, payload.data);
 
       const previous = this.ptyBufferBySession.get(payload.sessionId) || '';
-      this.ptyBufferBySession.set(payload.sessionId, previous + payload.data);
+      this.ptyBufferBySession.set(payload.sessionId, previous + displayData);
 
       void this.handleConnectionAutomation(payload.sessionId);
 
-      if (payload.sessionId === this.activeSessionId && this.terminal) {
-        this.terminal.write(payload.data);
+      if (payload.sessionId === this.activeSessionId && this.terminal && displayData) {
+        this.terminal.write(displayData);
       }
     });
 
@@ -389,10 +570,226 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.ptySessions.delete(payload.sessionId);
       this.pendingPtySessions.delete(payload.sessionId);
       this.ptySessionPromises.delete(payload.sessionId);
+      this.pendingPtyInputBySession.delete(payload.sessionId);
+      this.ptyInputFlushPromises.delete(payload.sessionId);
       this.activeConnectionRuntimes.delete(payload.sessionId);
+      this.failRunningExecutionForSession(payload.sessionId);
     });
 
     this.unlistenFunctions.push(unlistenPtyOutput, unlistenPtyExit);
+  }
+
+  private filterRunningExecutionDisplayOutput(sessionId: string, data: string): string {
+    const runningExecution = this.runningExecutionStatesBySession.get(sessionId);
+    if (!runningExecution) {
+      return data;
+    }
+
+    let filteredData = data;
+    if (runningExecution.wrappedCommand && runningExecution.wrappedCommand !== runningExecution.command) {
+      filteredData = filteredData.split(runningExecution.wrappedCommand).join(runningExecution.command);
+    }
+
+    if (runningExecution.startMarker && runningExecution.doneMarker) {
+      filteredData = filteredData
+        .replace(new RegExp(`\\r?\\n?${this.escapeRegExp(runningExecution.startMarker)}\\r?\\n?`, 'g'), '\r\n')
+        .replace(new RegExp(`\\r?\\n?${this.escapeRegExp(runningExecution.doneMarker)}:-?\\d+\\r?\\n?`, 'g'), '\r\n')
+        .replace(new RegExp(this.escapeRegExp(runningExecution.startMarker), 'g'), '')
+        .replace(new RegExp(`${this.escapeRegExp(runningExecution.doneMarker)}:-?\\d+`, 'g'), '');
+    }
+
+    return filteredData;
+  }
+
+  private captureRunningExecutionOutput(sessionId: string, data: string): void {
+    const runningExecution = this.runningExecutionStatesBySession.get(sessionId);
+    if (!runningExecution) {
+      return;
+    }
+
+    runningExecution.outputBuffer += data;
+    const doneMarkerIndex = runningExecution.outputBuffer.indexOf(runningExecution.doneMarker);
+    const hasMarkerCompletion = doneMarkerIndex !== -1;
+    const hasPromptCompletion = !hasMarkerCompletion && this.isPromptCompletionDetected(runningExecution);
+    if (!hasMarkerCompletion && !hasPromptCompletion) {
+      return;
+    }
+
+    const rawOutput = hasMarkerCompletion
+      ? this.extractRawOutputBetweenMarkers(
+          runningExecution.outputBuffer.slice(0, doneMarkerIndex),
+          runningExecution
+        )
+      : this.extractRawOutputFromPromptCompletion(runningExecution);
+    const exitCode = hasMarkerCompletion
+      ? this.parseExecutionExitCode(
+          runningExecution.outputBuffer.slice(doneMarkerIndex + runningExecution.doneMarker.length)
+        )
+      : undefined;
+
+    this.aiConversationService.completeCommandExecution(
+      runningExecution.executionId,
+      rawOutput,
+      exitCode
+    );
+    this.runningExecutionStatesBySession.delete(sessionId);
+    this.syncAiConversationState();
+    this.shouldScroll = true;
+  }
+
+  private isPromptCompletionDetected(runningExecution: RunningExecutionState): boolean {
+    const output = this.normalizeCapturedTerminalOutput(runningExecution.outputBuffer);
+    const lines = output.split('\n');
+    if (lines.length < 2 || !this.hasCapturedCommandEcho(lines, runningExecution.command)) {
+      return false;
+    }
+
+    const lastMeaningfulLine = [...lines].reverse().find((line) => line.trim().length > 0) || '';
+    return this.isLikelyShellPromptLine(lastMeaningfulLine);
+  }
+
+  private hasCapturedCommandEcho(lines: string[], command: string): boolean {
+    return lines.slice(0, 8).some((line) => this.isCommandEchoLine(line, command));
+  }
+
+  private extractRawOutputFromPromptCompletion(runningExecution: RunningExecutionState): string {
+    const output = this.normalizeCapturedTerminalOutput(runningExecution.outputBuffer);
+    const lines = output.split('\n');
+    const commandEchoIndex = lines.findIndex((line, index) =>
+      index < 8 && this.isCommandEchoLine(line, runningExecution.command)
+    );
+    const outputLines = commandEchoIndex >= 0 ? lines.slice(commandEchoIndex + 1) : lines;
+
+    while (outputLines.length > 0 && !outputLines[0].trim()) {
+      outputLines.shift();
+    }
+
+    while (outputLines.length > 0 && !outputLines[outputLines.length - 1].trim()) {
+      outputLines.pop();
+    }
+
+    if (outputLines.length > 0 && this.isLikelyShellPromptLine(outputLines[outputLines.length - 1])) {
+      outputLines.pop();
+    }
+
+    while (outputLines.length > 0 && !outputLines[outputLines.length - 1].trim()) {
+      outputLines.pop();
+    }
+
+    return this.removeCapturedCommandNoise(outputLines.join('\n'), runningExecution);
+  }
+
+  private isCommandEchoLine(line: string, command: string): boolean {
+    const normalizedLine = line.trimEnd();
+    const normalizedCommand = command.trim();
+    return normalizedLine === normalizedCommand || normalizedLine.endsWith(normalizedCommand);
+  }
+
+  private isLikelyShellPromptLine(line: string): boolean {
+    const trimmedLine = line.trimEnd();
+    if (!trimmedLine || trimmedLine.length > 180) {
+      return false;
+    }
+
+    return (
+      /^(?:\([^)]+\)\s*)?[\w.-]+@[\w.-]+(?:[: ][^\n]*)?\s[$#%]\s*$/.test(trimmedLine) ||
+      /^(?:\([^)]+\)\s*)?[\w.-]+@[\w.-]+\s+[^\n]*\s[%$#]\s*$/.test(trimmedLine) ||
+      /^PS\s+[^\n>]+>\s*$/.test(trimmedLine) ||
+      /^[A-Za-z]:\\[^\n>]*>\s*$/.test(trimmedLine) ||
+      /^[^\n]{1,120}\s[$#%]\s*$/.test(trimmedLine)
+    );
+  }
+
+  private parseExecutionExitCode(textAfterDoneMarker: string): number {
+    const exitCodeMatch = textAfterDoneMarker.match(/^:(-?\d+)/);
+    if (!exitCodeMatch) {
+      return 1;
+    }
+
+    const exitCode = Number(exitCodeMatch[1]);
+    return Number.isFinite(exitCode) ? exitCode : 1;
+  }
+
+  private extractRawOutputBetweenMarkers(
+    outputBeforeDoneMarker: string,
+    runningExecution: RunningExecutionState
+  ): string {
+    const startMarkerIndex = outputBeforeDoneMarker.indexOf(runningExecution.startMarker);
+    const rawOutput = startMarkerIndex >= 0
+      ? outputBeforeDoneMarker.slice(startMarkerIndex + runningExecution.startMarker.length)
+      : outputBeforeDoneMarker;
+
+    return this.removeCapturedCommandNoise(
+      this.normalizeCapturedTerminalOutput(rawOutput),
+      runningExecution
+    );
+  }
+
+  private normalizeCapturedTerminalOutput(output: string): string {
+    return output
+      .replace(/\x1B\][\s\S]*?(?:\x07|\x1B\\)/g, '')
+      .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
+      .replace(/\x07/g, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .replace(/^\n+/, '')
+      .replace(/\n+$/, '');
+  }
+
+  private removeCapturedCommandNoise(
+    output: string,
+    runningExecution: RunningExecutionState
+  ): string {
+    const command = runningExecution.command.trim();
+    const lines = output.split('\n').filter((line) => !this.isGeneratedExecutionNoiseLine(line));
+
+    while (lines.length > 0 && !lines[0].trim()) {
+      lines.shift();
+    }
+
+    if (command && lines[0]?.trim().endsWith(command)) {
+      lines.shift();
+    }
+
+    while (lines.length > 0 && !lines[lines.length - 1].trim()) {
+      lines.pop();
+    }
+
+    return lines.join('\n');
+  }
+
+  private isGeneratedExecutionNoiseLine(line: string): boolean {
+    return (
+      /__ait_marker_id=/.test(line) ||
+      /__ait_exit_code=/.test(line) ||
+      /unset __ait_marker_id/.test(line) ||
+      /__AI_TERMINAL_COMMAND_(?:START|DONE)_/.test(line) ||
+      /printf .*__AI_TERMINAL_COMMAND_(?:START|DONE)_/.test(line)
+    );
+  }
+
+  private escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  private failRunningExecutionForSession(sessionId: string): void {
+    const runningExecution = this.runningExecutionStatesBySession.get(sessionId);
+    if (!runningExecution) {
+      return;
+    }
+
+    const rawOutput = this.extractRawOutputBetweenMarkers(
+      runningExecution.outputBuffer,
+      runningExecution
+    );
+    this.aiConversationService.markCommandExecutionFailed(runningExecution.executionId, {
+      rawOutput,
+      outputPreview: rawOutput.trim() ? rawOutput.trim().slice(0, 700) : '(session closed before command completed)',
+      includedInContext: Boolean(rawOutput.trim()),
+      contextMode: rawOutput.trim() ? 'full' : 'none'
+    });
+    this.runningExecutionStatesBySession.delete(sessionId);
+    this.syncAiConversationState();
   }
 
   private async ensurePtySession(sessionId: string): Promise<void> {
@@ -407,10 +804,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     const cols = this.terminal.cols || 80;
     const rows = this.terminal.rows || 24;
+    const session = this.terminalSessions.find((candidate) => candidate.id === sessionId);
     this.pendingPtySessions.add(sessionId);
 
     const createSession = (async () => {
-      await invoke<void>('pty_create_session', { sessionId, cols, rows });
+      await invoke<void>('pty_create_session', {
+        sessionId,
+        cols,
+        rows,
+        launchKind: session?.terminalKind,
+        wslDistroName: session?.wslDistroName
+      });
       this.ptySessions.add(sessionId);
       if (!this.ptyBufferBySession.has(sessionId)) {
         this.ptyBufferBySession.set(sessionId, '');
@@ -432,18 +836,21 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    const sessionBuffer = this.ptyBufferBySession.get(this.activeSessionId) || '';
+    const sessionId = this.activeSessionId;
+    const sessionBuffer = this.ptyBufferBySession.get(sessionId) || '';
     this.isRenderingPtyBuffer = true;
     this.terminal.reset();
     if (sessionBuffer.length > 0) {
       this.terminal.write(sessionBuffer, () => {
         this.isRenderingPtyBuffer = false;
+        void this.flushPendingPtyInput(sessionId);
       });
       return;
     }
 
     queueMicrotask(() => {
       this.isRenderingPtyBuffer = false;
+      void this.flushPendingPtyInput(sessionId);
     });
   }
 
@@ -471,7 +878,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
     this.pendingPtySessions.clear();
     this.ptySessionPromises.clear();
+    this.pendingPtyInputBySession.clear();
+    this.ptyInputFlushPromises.clear();
+    this.runningExecutionStatesBySession.clear();
     this.activeConnectionRuntimes.clear();
+    if (this.copyToastTimeoutId !== undefined) {
+      window.clearTimeout(this.copyToastTimeoutId);
+      this.copyToastTimeoutId = undefined;
+    }
     this.terminal?.dispose();
     this.fitAddon = null;
     this.terminal = null;
@@ -492,6 +906,31 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.shouldScroll = false;
       this.scrollFramePending = false;
     });
+  }
+
+  private ensureAiConversationForCurrentSession(): AiConversation {
+    const sessionId = this.activeSessionId || 'unassigned-terminal-session';
+    const conversation = this.aiConversationService.ensureConversationForTerminalSession(sessionId);
+    this.syncAiConversationState();
+    return conversation;
+  }
+
+  private getConversationForNextQuestion(): { conversation: AiConversation; isNewConversation: boolean } {
+    const activeConversation = this.aiConversationService.getActiveConversation();
+    if (activeConversation) {
+      return { conversation: activeConversation, isNewConversation: false };
+    }
+
+    const conversation = this.aiConversationService.createConversation(
+      this.activeSessionId || 'unassigned-terminal-session'
+    );
+    return { conversation, isNewConversation: true };
+  }
+
+  private syncAiConversationState(): void {
+    this.aiConversations = this.aiConversationService.listConversations();
+    this.activeAiConversationId = this.aiConversationService.getActiveConversationId();
+    this.activeAiConversation = this.aiConversationService.getActiveConversation();
   }
 
   private scrollToBottom() {
@@ -581,23 +1020,89 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.showCopiedNotification();
   }
 
-  // Add visual feedback when copying
-  showCopiedNotification(): void {
-    const notification = document.createElement('div');
-    notification.className = 'copy-notification';
-    notification.textContent = 'Copied!';
-    document.body.appendChild(notification);
+  copyCommandSuggestion(suggestion: CommandSuggestion): void {
+    this.copyCodeBlock(suggestion.command);
+  }
 
-    // Animate and remove
-    setTimeout(() => {
-      notification.classList.add('show');
-      setTimeout(() => {
-        notification.classList.remove('show');
-        setTimeout(() => {
-          document.body.removeChild(notification);
-        }, 300);
-      }, 1200);
-    }, 10);
+  getCommandExplanationState(suggestion: CommandSuggestion): CommandExplanationState | undefined {
+    return this.commandExplanationStates[suggestion.id];
+  }
+
+  async toggleCommandExplanation(suggestion: CommandSuggestion): Promise<void> {
+    const existingState = this.commandExplanationStates[suggestion.id];
+    if (existingState?.isOpen) {
+      this.setCommandExplanationState(suggestion.id, { isOpen: false });
+      return;
+    }
+
+    const nextState = existingState || this.createEmptyCommandExplanationState(suggestion.id);
+    this.commandExplanationStates = {
+      ...this.commandExplanationStates,
+      [suggestion.id]: {
+        ...nextState,
+        isOpen: true
+      }
+    };
+
+    if (!nextState.turns.length && !nextState.isLoading) {
+      await this.requestCommandExplanation(suggestion);
+    }
+  }
+
+  updateCommandExplanationFollowUp(suggestionId: string, value: string): void {
+    this.setCommandExplanationState(suggestionId, { followUpQuestion: value });
+  }
+
+  async onCommandExplanationFollowUpKeydown(
+    event: KeyboardEvent,
+    suggestion: CommandSuggestion
+  ): Promise<void> {
+    if (event.key !== 'Enter' || event.shiftKey) {
+      return;
+    }
+
+    event.preventDefault();
+    await this.submitCommandExplanationFollowUp(suggestion);
+  }
+
+  async submitCommandExplanationFollowUp(suggestion: CommandSuggestion): Promise<void> {
+    const state = this.commandExplanationStates[suggestion.id];
+    const question = state?.followUpQuestion.trim();
+    if (!state || !question || state.isLoading) {
+      return;
+    }
+
+    const userTurn: CommandExplanationTurn = {
+      role: 'user',
+      content: question,
+      createdAt: new Date().toISOString()
+    };
+
+    this.commandExplanationStates = {
+      ...this.commandExplanationStates,
+      [suggestion.id]: {
+        ...state,
+        followUpQuestion: '',
+        turns: [...state.turns, userTurn]
+      }
+    };
+
+    await this.requestCommandExplanation(suggestion);
+  }
+
+  // Add visual feedback when copying
+  showCopiedNotification(message: string = 'Copied!'): void {
+    this.copyToastMessage = message;
+    this.isCopyToastVisible = true;
+
+    if (this.copyToastTimeoutId !== undefined) {
+      window.clearTimeout(this.copyToastTimeoutId);
+    }
+
+    this.copyToastTimeoutId = window.setTimeout(() => {
+      this.isCopyToastVisible = false;
+      this.copyToastTimeoutId = undefined;
+    }, 1500);
   }
 
   // Check if a code block is a simple command (no special formatting needed)
@@ -606,7 +1111,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   // Calls an OpenAI-compatible Chat Completions endpoint with terminal context.
-  async callOpenAiCompatibleApi(question: string, model: string): Promise<string> {
+  async callOpenAiCompatibleApi(
+    question: string,
+    model: string,
+    conversationId: string,
+    currentUserMessageId: string,
+    signal?: AbortSignal
+  ): Promise<string> {
     try {
       if (!this.aiApiKey.trim()) {
         return 'Error: OpenAI compatible API key is not configured. Open Settings and add a key.';
@@ -618,51 +1129,31 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       // Get the current operating system
       const os = this.detectOperatingSystem();
+      const environmentContext = this.getTerminalAssistantEnvironmentContext();
 
-      const systemPrompt = buildTerminalAssistantSystemPrompt(os);
+      const systemPrompt = buildTerminalAssistantSystemPrompt(os, environmentContext);
 
       // Build messages array with conversation context.
       const messages: { role: string; content: string }[] = [
         { role: 'system', content: systemPrompt }
       ];
 
-      // Add previous chat history (exclude the current pending "Thinking..." entry)
-      const completedChatHistory = this.chatHistory.slice(0, -1);
-      for (const entry of completedChatHistory) {
-        if (entry.response && entry.response !== 'Thinking...') {
-          messages.push({ role: 'user', content: entry.message });
-          messages.push({ role: 'assistant', content: entry.response });
-        }
-      }
+      const conversation = this.aiConversationService.getConversation(conversationId);
+      const conversationMessages = conversation?.messages || [];
+      const currentUserContent = await this.buildCurrentUserContent(question, conversationId);
 
-      // Get current folder (try backend for fresher value, fallback to session state)
-      let currentFolder = this.currentWorkingDirectory || '~';
-      if (this.activeSessionId) {
-        try {
-          const cwd = await invoke<string>('get_working_directory', {
-            sessionId: this.activeSessionId
-          });
-          if (cwd?.trim()) {
-            currentFolder = cwd;
-          }
-        } catch {
-          // Keep currentWorkingDirectory fallback
+      for (const message of conversationMessages) {
+        if (message.role === 'assistant' && message.content === 'Thinking...') {
+          continue;
         }
-      }
 
-      // Build the current user message with context (folder, commands, question)
-      const contextParts: string[] = [];
-      contextParts.push(`Current folder: ${currentFolder}`);
-      const lastCommands = this.commandHistory
-        .filter(c => c.command?.trim())
-        .slice(-4)
-        .map(c => c.command.trim());
-      if (lastCommands.length > 0) {
-        contextParts.push(`Recent terminal commands (last ${lastCommands.length}):\n${lastCommands.map(c => `  $ ${c}`).join('\n')}`);
+        messages.push({
+          role: message.role,
+          content: message.id === currentUserMessageId
+            ? currentUserContent
+            : this.serializeAiMessageContentForApi(message)
+        });
       }
-      contextParts.push(`Current question: ${question}`);
-      const userContent = contextParts.join('\n\n');
-      messages.push({ role: 'user', content: userContent });
 
       const requestBody = {
         model: model,
@@ -679,7 +1170,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.aiApiKey.trim()}`
         },
-        body: JSON.stringify(requestBody)
+        body: JSON.stringify(requestBody),
+        signal
       });
 
       if (!response.ok) {
@@ -697,6 +1189,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       return content;
     } catch (error: any) {
+      if (this.isAbortError(error)) {
+        throw error;
+      }
 
       // Add more specific error messages for different failure types
       if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
@@ -705,6 +1200,228 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       return `Error: ${error.message || 'Unknown error calling OpenAI compatible API'}`;
     }
+  }
+
+  private isAbortError(error: any): boolean {
+    return error?.name === 'AbortError' || String(error?.message || '').toLowerCase().includes('abort');
+  }
+
+  private async buildCurrentUserContent(question: string, conversationId: string): Promise<string> {
+    let currentFolder = this.currentWorkingDirectory || '~';
+    if (this.activeSessionId) {
+      try {
+        const cwd = await invoke<string>('get_working_directory', {
+          sessionId: this.activeSessionId
+        });
+        if (cwd?.trim()) {
+          currentFolder = cwd;
+        }
+      } catch {
+        // Keep currentWorkingDirectory fallback.
+      }
+    }
+
+    const contextParts: string[] = [];
+    contextParts.push(`Current folder: ${currentFolder}`);
+    const environmentContext = this.getTerminalAssistantEnvironmentContext();
+    if (environmentContext?.connectionType || environmentContext?.terminalKind === 'local-wsl') {
+      contextParts.push([
+        `Active terminal target: ${environmentContext.connectionType || 'WSL'}`,
+        environmentContext.profileName ? `Profile: ${environmentContext.profileName}` : '',
+        environmentContext.targetHost ? `Target host: ${environmentContext.targetHost}` : '',
+        environmentContext.targetUser ? `Target user: ${environmentContext.targetUser}` : '',
+        environmentContext.wslDistroName ? `WSL distro: ${environmentContext.wslDistroName}` : '',
+        environmentContext.serverContext ? `Server context:\n${environmentContext.serverContext}` : ''
+      ].filter(Boolean).join('\n'));
+    }
+    const lastCommands = this.commandHistory
+      .filter(c => c.command?.trim())
+      .slice(-4)
+      .map(c => c.command.trim());
+    if (lastCommands.length > 0) {
+      contextParts.push(`Recent terminal commands (last ${lastCommands.length}):\n${lastCommands.map(c => `  $ ${c}`).join('\n')}`);
+    }
+    const executionContext = this.aiConversationService.buildExecutionContextText(
+      this.aiConversationService.getConversation(conversationId)
+    );
+    if (executionContext) {
+      contextParts.push(executionContext);
+    }
+    contextParts.push(`Current question: ${question}`);
+
+    return contextParts.join('\n\n');
+  }
+
+  private async requestCommandExplanation(suggestion: CommandSuggestion): Promise<void> {
+    if (!this.aiApiKey.trim()) {
+      this.setCommandExplanationState(suggestion.id, {
+        error: 'OpenAI compatible API key is not configured.',
+        isLoading: false
+      });
+      return;
+    }
+
+    if (!this.currentLLMModel.trim()) {
+      this.setCommandExplanationState(suggestion.id, {
+        error: 'No model is selected.',
+        isLoading: false
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    this.commandExplanationAbortControllers.set(suggestion.id, controller);
+    this.setCommandExplanationState(suggestion.id, {
+      error: undefined,
+      isLoading: true
+    });
+
+    try {
+      const response = await this.callCommandExplanationApi(suggestion, controller.signal);
+      const assistantTurn: CommandExplanationTurn = {
+        role: 'assistant',
+        content: response,
+        createdAt: new Date().toISOString()
+      };
+      const state = this.commandExplanationStates[suggestion.id] || this.createEmptyCommandExplanationState(suggestion.id);
+      this.commandExplanationStates = {
+        ...this.commandExplanationStates,
+        [suggestion.id]: {
+          ...state,
+          isOpen: true,
+          isLoading: false,
+          turns: [...state.turns, assistantTurn]
+        }
+      };
+    } catch (error: any) {
+      const errorText = this.isAbortError(error)
+        ? 'Command explanation stopped.'
+        : `Could not explain command: ${error.message || error}`;
+      this.setCommandExplanationState(suggestion.id, {
+        error: errorText,
+        isLoading: false
+      });
+    } finally {
+      this.commandExplanationAbortControllers.delete(suggestion.id);
+    }
+  }
+
+  private async callCommandExplanationApi(
+    suggestion: CommandSuggestion,
+    signal: AbortSignal
+  ): Promise<string> {
+    const state = this.commandExplanationStates[suggestion.id] || this.createEmptyCommandExplanationState(suggestion.id);
+    const systemPrompt = [
+      'You explain terminal commands for production troubleshooting.',
+      'Answer in Chinese.',
+      'Be concrete and safety-oriented.',
+      'Explain what the command does, why it may be useful, key risks, and safer alternatives when relevant.',
+      'Do not execute commands.'
+    ].join('\n');
+    const environmentContext = this.getTerminalAssistantEnvironmentContext();
+
+    const messages: { role: string; content: string }[] = [
+      {
+        role: 'system',
+        content: [
+          systemPrompt,
+          environmentContext?.serverContext
+            ? `Active terminal server context:\n${environmentContext.serverContext}`
+            : ''
+        ].filter(Boolean).join('\n\n')
+      },
+      {
+        role: 'user',
+        content: [
+          'Explain this command suggestion.',
+          `Command: ${suggestion.command}`,
+          `Risk level: ${suggestion.riskLevel}`,
+          suggestion.explanation ? `Existing short explanation: ${suggestion.explanation}` : ''
+        ].filter(Boolean).join('\n')
+      }
+    ];
+
+    for (const turn of state.turns) {
+      messages.push({
+        role: turn.role,
+        content: turn.content
+      });
+    }
+
+    const normalizedBaseUrl = this.openAiConnectionService.normalizeBaseUrl(this.aiApiBaseUrl);
+    const response = await fetch(`${normalizedBaseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.aiApiKey.trim()}`
+      },
+      body: JSON.stringify({
+        model: this.currentLLMModel,
+        messages,
+        stream: false
+      }),
+      signal
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`OpenAI compatible API error: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error('Unexpected response format from OpenAI compatible API');
+    }
+
+    return content;
+  }
+
+  private createEmptyCommandExplanationState(suggestionId: string): CommandExplanationState {
+    return {
+      suggestionId,
+      isOpen: false,
+      isLoading: false,
+      followUpQuestion: '',
+      turns: []
+    };
+  }
+
+  private setCommandExplanationState(
+    suggestionId: string,
+    patch: Partial<CommandExplanationState>
+  ): void {
+    const state = this.commandExplanationStates[suggestionId] || this.createEmptyCommandExplanationState(suggestionId);
+    this.commandExplanationStates = {
+      ...this.commandExplanationStates,
+      [suggestionId]: {
+        ...state,
+        ...patch
+      }
+    };
+  }
+
+  private serializeAiMessageContentForApi(message: AiMessage): string {
+    if (
+      (!message.codeBlocks || message.codeBlocks.length === 0) &&
+      (!message.suggestions || message.suggestions.length === 0)
+    ) {
+      return message.content;
+    }
+
+    return message.content.replace(/<code-block-(\d+)><\/code-block-\d+>/g, (_placeholder, indexText: string) => {
+      const index = Number(indexText);
+      const suggestion = message.suggestions?.[index];
+      const codeBlock = message.codeBlocks?.[index];
+      const command = suggestion?.command || codeBlock?.code;
+      if (!command) {
+        return '';
+      }
+
+      const codeBlockLanguage = codeBlock?.language || 'command';
+      const language = codeBlockLanguage === 'command' ? 'bash' : codeBlockLanguage;
+      return `\`\`\`${language || 'bash'}\n${command}\n\`\`\``;
+    });
   }
 
   private detectOperatingSystem(): string {
@@ -729,7 +1446,23 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     event.preventDefault();
+    await this.submitCurrentQuestion();
+  }
 
+  async onAiRunButtonClick(): Promise<void> {
+    if (this.isProcessingAI) {
+      this.stopAIResponse();
+      return;
+    }
+
+    await this.submitCurrentQuestion();
+  }
+
+  stopAIResponse(): void {
+    this.aiAbortController?.abort();
+  }
+
+  private async submitCurrentQuestion(): Promise<void> {
     // Skip if no question or currently processing
     if (!this.currentQuestion.trim() || this.isProcessingAI) {
       return;
@@ -740,44 +1473,76 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     let response = '';
 
     this.isProcessingAI = true;
+    this.aiAbortController = new AbortController();
+    let shouldClearActiveConversationAfterRequest = false;
+    let requestConversationId = '';
 
     try {
-      // Add to chat history immediately to show pending state
-      const chatEntry: ChatHistory = {
-        message: this.currentQuestion,
-        response: "Thinking...",
-        timestamp: new Date(),
-        isCommand: isCommand
-      };
+      const { conversation, isNewConversation } = this.getConversationForNextQuestion();
+      shouldClearActiveConversationAfterRequest = isNewConversation;
+      requestConversationId = conversation.id;
+      const question = this.currentQuestion;
+      const userMessage = this.aiConversationService.addMessage(conversation.id, {
+        role: 'user',
+        content: question,
+        isCommand
+      });
+      const assistantMessage = this.aiConversationService.addMessage(conversation.id, {
+        role: 'assistant',
+        content: 'Thinking...',
+        isCommand
+      });
 
-      this.chatHistory.push(chatEntry);
+      this.syncAiConversationState();
+      this.currentQuestion = '';
       this.shouldScroll = true;
 
       if (isCommand) {
-        response = await this.handleAICommand(this.currentQuestion);
+        response = await this.handleAICommand(question);
       } else {
-        response = await this.callOpenAiCompatibleApi(this.currentQuestion, this.currentLLMModel);
+        response = await this.callOpenAiCompatibleApi(
+          question,
+          this.currentLLMModel,
+          conversation.id,
+          userMessage.id,
+          this.aiAbortController.signal
+        );
 
         // Check if the response contains a command we can execute
         const commandParts = this.parseCommandFromResponse(response);
         const hasCommands = commandParts.some(part => part.command);
         if (hasCommands) {
           // If this is a direct shell command question, we can enhance the UI by marking it as a command
-          chatEntry.isCommand = true;
+          assistantMessage.isCommand = true;
         }
       }
 
-      // Use the new method to process the response
-      this.processNewChatEntry(chatEntry, response);
+      this.processAssistantMessage(conversation.id, assistantMessage.id, response, assistantMessage.isCommand);
 
       // Clear current question and scroll to bottom
-      this.currentQuestion = '';
+      if (shouldClearActiveConversationAfterRequest) {
+        this.aiConversationService.clearActiveConversation();
+        this.syncAiConversationState();
+      }
       this.shouldScroll = true;
     } catch (error) {
-      console.error('Failed to process AI request:', error);
-      this.chatHistory[this.chatHistory.length - 1].response = `Error: ${error}`;
+      if (this.isAbortError(error)) {
+        this.updateLatestAssistantMessage('AI response stopped.');
+      } else {
+        console.error('Failed to process AI request:', error);
+        this.updateLatestAssistantMessage(`Error: ${error}`);
+      }
     } finally {
+      if (
+        shouldClearActiveConversationAfterRequest &&
+        requestConversationId &&
+        this.aiConversationService.getActiveConversationId() === requestConversationId
+      ) {
+        this.aiConversationService.clearActiveConversation();
+        this.syncAiConversationState();
+      }
       this.isProcessingAI = false;
+      this.aiAbortController = null;
     }
   }
 
@@ -796,6 +1561,24 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   getCodeBlockIndex(placeholder: string): number {
     return this.aiResponseFormatService.getCodeBlockIndex(placeholder);
+  }
+
+  getMessageCodeBlock(message: AiMessage, placeholder: string): AiCodeBlock | undefined {
+    const index = this.getCodeBlockIndex(placeholder);
+    if (index < 0) {
+      return undefined;
+    }
+
+    return message.codeBlocks?.[index];
+  }
+
+  getMessageSuggestion(message: AiMessage, placeholder: string): CommandSuggestion | undefined {
+    const index = this.getCodeBlockIndex(placeholder);
+    if (index < 0) {
+      return undefined;
+    }
+
+    return message.suggestions?.[index];
   }
 
   // Handle AI commands starting with /
@@ -825,7 +1608,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.saveAiSettings();
       },
       clearChatHistory: () => {
-        this.chatHistory = [];
+        this.aiConversationService.clearActiveConversationMessages();
+        this.syncAiConversationState();
       },
       testOpenAiConnection: () => {
         void this.testOpenAiConnection();
@@ -846,33 +1630,143 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   // Make sure all code blocks in the chat history are properly sanitized
   sanitizeAllCodeBlocks(): void {
-    // Go through all chat history entries
-    for (const entry of this.chatHistory) {
-      // Skip entries without code blocks
-      if (!entry.codeBlocks || entry.codeBlocks.length === 0) {
-        continue;
-      }
+    for (const conversation of this.aiConversations) {
+      for (const message of conversation.messages) {
+        if (!message.codeBlocks || message.codeBlocks.length === 0) {
+          continue;
+        }
 
-      // Sanitize each code block to remove backticks
-      for (const codeBlock of entry.codeBlocks) {
-        codeBlock.code = this.transformCodeForDisplay(codeBlock.code);
+        message.codeBlocks = message.codeBlocks.map((codeBlock) => ({
+          ...codeBlock,
+          code: this.transformCodeForDisplay(codeBlock.code)
+        }));
       }
     }
   }
 
-  // Process newly added chat entry
-  processNewChatEntry(entry: ChatHistory, response: string): void {
-    // Process the response to extract code blocks
+  processAssistantMessage(
+    conversationId: string,
+    messageId: string,
+    response: string,
+    isCommand: boolean = false
+  ): void {
     const { formattedText, codeBlocks } = this.extractCodeBlocks(response);
+    const createdAt = new Date().toISOString();
+    const suggestions = codeBlocks.map((codeBlock, index) =>
+      this.createCommandSuggestion(conversationId, messageId, codeBlock.code, index, createdAt)
+    );
+    const sanitizedCodeBlocks = suggestions.map((suggestion, index) => ({
+      code: suggestion.command,
+      language: codeBlocks[index]?.language || 'command'
+    }));
 
-    // Sanitize all code blocks to remove backticks
-    for (const codeBlock of codeBlocks) {
-      codeBlock.code = this.transformCodeForDisplay(codeBlock.code);
+    this.aiConversationService.updateMessage(conversationId, messageId, {
+      content: formattedText,
+      codeBlocks: sanitizedCodeBlocks,
+      suggestions,
+      isCommand
+    });
+    this.syncAiConversationState();
+  }
+
+  private createCommandSuggestion(
+    conversationId: string,
+    messageId: string,
+    rawCommand: string,
+    index: number,
+    createdAt: string
+  ): CommandSuggestion {
+    const explanation = this.aiResponseFormatService.getCommandExplanation(rawCommand) || undefined;
+
+    return {
+      id: `${messageId}-suggestion-${index}`,
+      conversationId,
+      messageId,
+      command: this.transformCodeForDisplay(rawCommand),
+      explanation,
+      riskLevel: 'review',
+      createdAt
+    };
+  }
+
+  private updateLatestAssistantMessage(content: string): void {
+    const conversation = this.aiConversationService.getActiveConversation();
+    const latestAssistantMessage = [...(conversation?.messages || [])]
+      .reverse()
+      .find((message) => message.role === 'assistant');
+
+    if (!conversation || !latestAssistantMessage) {
+      return;
     }
 
-    // Update the chat entry
-    entry.response = formattedText;
-    entry.codeBlocks = codeBlocks;
+    this.aiConversationService.updateMessage(conversation.id, latestAssistantMessage.id, { content });
+    this.syncAiConversationState();
+  }
+
+  getAiMessageLabel(message: AiMessage): string {
+    if (message.role === 'user') {
+      return 'You';
+    }
+
+    if (message.role === 'system') {
+      return 'System';
+    }
+
+    return 'AI';
+  }
+
+  createNewAiConversation(): void {
+    this.aiConversationService.clearActiveConversation();
+    this.syncAiConversationState();
+    this.shouldScroll = true;
+  }
+
+  switchAiConversation(conversationId: string): void {
+    this.aiConversationService.setActiveConversation(conversationId);
+    this.syncAiConversationState();
+    this.shouldScroll = true;
+  }
+
+  continueAiConversation(conversationId: string): void {
+    this.switchAiConversation(conversationId);
+  }
+
+  getConversationSessionName(conversation: AiConversation): string {
+    return this.terminalSessions.find((session) => session.id === conversation.terminalSessionId)?.name || 'No session';
+  }
+
+  getConversationMessageCount(conversation: AiConversation): number {
+    return conversation.messages.length;
+  }
+
+  trackByAiConversationId(_: number, conversation: AiConversation): string {
+    return conversation.id;
+  }
+
+  trackByAiMessageId(_: number, message: AiMessage): string {
+    return message.id;
+  }
+
+  // Compatibility path for connection-test messages that still arrive as ChatHistory entries.
+  processNewChatEntry(entry: ChatHistory, response: string): void {
+    const activeConversation = this.ensureAiConversationForCurrentSession();
+    const assistantMessage = this.aiConversationService.addMessage(activeConversation.id, {
+      role: 'assistant',
+      content: 'Thinking...',
+      isCommand: entry.isCommand
+    });
+    this.processAssistantMessage(activeConversation.id, assistantMessage.id, response, entry.isCommand);
+  }
+
+  private addSystemMessageFromChatEntry(entry: ChatHistory): void {
+    const activeConversation = this.ensureAiConversationForCurrentSession();
+    this.aiConversationService.addMessage(activeConversation.id, {
+      role: 'system',
+      content: entry.response || entry.message,
+      isCommand: entry.isCommand
+    });
+    this.syncAiConversationState();
+    this.shouldScroll = true;
   }
 
   // Helper method to focus the terminal textarea
@@ -896,7 +1790,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.saveAiSettings();
       },
       addChatEntry: (entry: ChatHistory) => {
-        this.chatHistory.push(entry);
+        this.addSystemMessageFromChatEntry(entry);
       }
     });
   }
@@ -914,7 +1808,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.saveAiSettings();
       },
       addChatEntry: (entry: ChatHistory) => {
-        this.chatHistory.push(entry);
+        this.addSystemMessageFromChatEntry(entry);
       }
     });
   }
@@ -923,9 +1817,104 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.connectionProfiles = this.connectionProfileService.listProfiles();
   }
 
-  openConnectionManager(): void {
+  get localTerminalProfiles(): TerminalProfileViewItem[] {
+    return this.getTerminalProfileItems().filter((item) => item.group === 'local');
+  }
+
+  get wslTerminalProfiles(): TerminalProfileViewItem[] {
+    return this.getTerminalProfileItems().filter((item) => item.group === 'wsl');
+  }
+
+  get connectionTerminalProfiles(): TerminalProfileViewItem[] {
+    return this.getTerminalProfileItems().filter((item) => item.group === 'connection');
+  }
+
+  private getTerminalProfileItems(): TerminalProfileViewItem[] {
+    const items: TerminalProfileViewItem[] = [];
+    const os = this.detectOperatingSystem();
+
+    if (os === 'Windows') {
+      items.push({
+        id: 'builtin-powershell',
+        source: 'builtin',
+        kind: 'local-powershell',
+        name: 'PowerShell',
+        displayName: 'powershell.exe',
+        status: 'Built-in',
+        group: 'local',
+        editable: false,
+        deletable: false,
+        probeable: true
+      });
+      items.push({
+        id: 'builtin-powershell-admin',
+        source: 'builtin',
+        kind: 'local-powershell-admin',
+        name: 'PowerShell (Administrator)',
+        displayName: 'Requires app restart as administrator',
+        status: 'Built-in',
+        group: 'local',
+        editable: false,
+        deletable: false,
+        probeable: true,
+        disabled: true,
+        disabledReason: 'Administrator PTY requires a future elevated helper.'
+      });
+    } else if (os === 'macOS') {
+      items.push({
+        id: 'builtin-zsh',
+        source: 'builtin',
+        kind: 'local-zsh',
+        name: 'zsh',
+        displayName: '/bin/zsh',
+        status: 'Built-in',
+        group: 'local',
+        editable: false,
+        deletable: false,
+        probeable: true
+      });
+    }
+
+    for (const distro of this.wslDistributions) {
+      items.push({
+        id: `wsl-${distro.name}`,
+        source: 'wsl',
+        kind: 'local-wsl',
+        name: distro.name,
+        displayName: `WSL${distro.version ? ` ${distro.version}` : ''}${distro.isDefault ? ' · default' : ''}`,
+        status: distro.state,
+        group: 'wsl',
+        editable: false,
+        deletable: false,
+        probeable: true,
+        wslDistroName: distro.name
+      });
+    }
+
+    for (const profile of this.connectionProfiles) {
+      items.push({
+        id: `connection-${profile.id}`,
+        source: 'connection',
+        kind: profile.type === 'jumpserver' ? 'jumpserver' : 'ssh',
+        name: profile.name,
+        displayName: this.generateConnectionDisplayName(profile),
+        status: this.getConnectionTypeLabel(profile.type),
+        group: 'connection',
+        editable: true,
+        deletable: true,
+        probeable: true,
+        connectionProfile: profile,
+        connectionProfileId: profile.id
+      });
+    }
+
+    return items;
+  }
+
+  async openConnectionManager(): Promise<void> {
     this.loadConnectionProfiles();
     this.isConnectionManagerOpen = true;
+    void this.loadWslDistributions();
   }
 
   closeConnectionManager(): void {
@@ -933,8 +1922,152 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.isConnectionFormOpen = false;
   }
 
+  async toggleTerminalLauncher(event: MouseEvent): Promise<void> {
+    event.stopPropagation();
+    this.isTerminalLauncherOpen = !this.isTerminalLauncherOpen;
+  }
+
+  closeTerminalLauncher(): void {
+    this.isTerminalLauncherOpen = false;
+  }
+
+  selectTerminalFromLauncher(sessionId: string): void {
+    this.closeTerminalLauncher();
+    this.switchToSession(sessionId);
+  }
+
+  getTerminalSessionKindLabel(session: TerminalSession): string {
+    if (session.connectionProfileId) {
+      return session.terminalKind === 'jumpserver' ? 'JumpServer' : 'SSH';
+    }
+
+    if (session.terminalKind === 'local-wsl') {
+      return 'WSL';
+    }
+
+    if (session.terminalKind === 'local-zsh') {
+      return 'zsh';
+    }
+
+    return 'PowerShell';
+  }
+
+  private loadWslDistributions(forceRefresh = false): Promise<void> {
+    if (this.detectOperatingSystem() !== 'Windows') {
+      this.wslDistributions = [];
+      return Promise.resolve();
+    }
+
+    if (this.wslDistributionsLoaded && !forceRefresh) {
+      return Promise.resolve();
+    }
+
+    if (this.wslDistributionsLoadPromise) {
+      return this.wslDistributionsLoadPromise;
+    }
+
+    const now = Date.now();
+    if (!forceRefresh && this.lastWslDistributionsLoadAttemptAt > 0 && now - this.lastWslDistributionsLoadAttemptAt < 30000) {
+      return Promise.resolve();
+    }
+
+    this.lastWslDistributionsLoadAttemptAt = now;
+    this.isLoadingTerminalProfiles = true;
+    this.terminalProfilesStatus = '';
+    this.wslDistributionsLoadPromise = invoke<WslDistribution[]>('list_wsl_distributions')
+      .then((distributions) => {
+        this.wslDistributions = distributions;
+        this.terminalProfilesStatus = '';
+        this.wslDistributionsLoaded = true;
+      })
+      .catch((error: any) => {
+        this.wslDistributions = [];
+        this.terminalProfilesStatus = `Could not load WSL distributions: ${error.message || error}`;
+      })
+      .finally(() => {
+        this.isLoadingTerminalProfiles = false;
+        this.wslDistributionsLoadPromise = null;
+      });
+
+    return this.wslDistributionsLoadPromise;
+  }
+
   closeConnectionForm(): void {
     this.isConnectionFormOpen = false;
+  }
+
+  openDefaultTerminalSession(): void {
+    const defaultTerminalKind = this.getDefaultTerminalKind();
+    this.createNewSession(
+      this.getDefaultTerminalName(defaultTerminalKind),
+      true,
+      undefined,
+      defaultTerminalKind
+    );
+  }
+
+  private getDefaultTerminalKind(): TerminalProfileKind {
+    return this.detectOperatingSystem() === 'macOS' ? 'local-zsh' : 'local-powershell';
+  }
+
+  private getDefaultTerminalName(kind: TerminalProfileKind): string {
+    if (kind === 'local-zsh') {
+      return 'zsh';
+    }
+
+    return 'PowerShell';
+  }
+
+  async openTerminalProfile(item: TerminalProfileViewItem): Promise<void> {
+    if (item.disabled) {
+      this.connectionStatus = item.disabledReason || 'This terminal profile is not available yet.';
+      return;
+    }
+
+    this.closeTerminalLauncher();
+    if (this.isConnectionManagerOpen) {
+      this.closeConnectionManager();
+    }
+
+    if (item.source === 'connection' && item.connectionProfile) {
+      await this.connectConnectionProfile(item.connectionProfile);
+      return;
+    }
+
+    if (item.kind === 'local-wsl') {
+      this.createNewSession(item.name, true, undefined, 'local-wsl', item.wslDistroName);
+      return;
+    }
+
+    this.createNewSession(item.name, true, undefined, item.kind);
+  }
+
+  editTerminalProfile(item: TerminalProfileViewItem): void {
+    if (item.connectionProfile) {
+      this.editConnectionProfile(item.connectionProfile);
+    }
+  }
+
+  duplicateTerminalProfile(item: TerminalProfileViewItem): void {
+    if (item.connectionProfile) {
+      this.duplicateConnectionProfile(item.connectionProfile);
+    }
+  }
+
+  deleteTerminalProfile(item: TerminalProfileViewItem): void {
+    if (item.connectionProfile) {
+      this.deleteConnectionProfile(item.connectionProfile);
+    }
+  }
+
+  async probeTerminalProfile(item: TerminalProfileViewItem): Promise<void> {
+    if (!item.connectionProfile) {
+      this.connectionStatus = 'Local terminal probing will be implemented later.';
+      return;
+    }
+
+    this.editConnectionProfile(item.connectionProfile);
+    await this.probeConnectionProfileFromForm();
   }
 
   startNewConnectionProfile(): void {
@@ -953,7 +2086,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.isConnectionFormOpen = true;
   }
 
-  saveConnectionProfile(): void {
+  async saveConnectionProfile(): Promise<void> {
     const payload = this.formToProfileInput();
     if (!payload.name?.trim()) {
       this.connectionStatus = 'Connection name is required.';
@@ -961,6 +2094,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     if (this.connectionFormMode === 'edit' && this.editingConnectionProfileId) {
+      await this.persistServerContextFileForProfile(this.editingConnectionProfileId, payload);
       const updatedProfile = this.connectionProfileService.updateProfile(
         this.editingConnectionProfileId,
         payload
@@ -978,11 +2112,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const createdProfile = this.connectionProfileService.createProfile(
       payload as CreateConnectionProfileInput
     );
+    await this.persistServerContextFileForProfile(createdProfile.id, payload);
+    const profileWithContextPath = this.connectionProfileService.updateProfile(createdProfile.id, payload) || createdProfile;
     this.loadConnectionProfiles();
     this.connectionFormMode = 'edit';
-    this.editingConnectionProfileId = createdProfile.id;
-    this.connectionForm = this.profileToForm(createdProfile);
-    this.connectionStatus = `Created ${createdProfile.name}.`;
+    this.editingConnectionProfileId = profileWithContextPath.id;
+    this.connectionForm = this.profileToForm(profileWithContextPath);
+    this.connectionStatus = `Created ${profileWithContextPath.name}.`;
     this.isConnectionFormOpen = false;
   }
 
@@ -1015,13 +2151,271 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.connectionStatus = deleted ? `Deleted ${profile.name}.` : 'Connection profile was not found.';
   }
 
+  private async persistServerContextFileForProfile(
+    profileId: string,
+    payload: CreateConnectionProfileInput | UpdateConnectionProfilePatch
+  ): Promise<void> {
+    const context = typeof payload.serverContext === 'string' ? payload.serverContext : '';
+    if (!context.trim()) {
+      payload.serverContextPath = undefined;
+      return;
+    }
+
+    try {
+      const path = await invoke<string>('save_server_context_file', {
+        profileId,
+        context
+      });
+      payload.serverContextPath = path;
+      this.connectionForm.serverContextPath = path;
+    } catch (error: any) {
+      const message = error?.message || error;
+      this.connectionStatus = `Saved profile data, but failed to write server context file: ${message}`;
+    }
+  }
+
+  async probeConnectionProfileFromForm(): Promise<void> {
+    if (this.isProbingConnectionProfile) {
+      return;
+    }
+
+    let probeSessionId = '';
+    const startedAt = new Date().toISOString();
+    try {
+      const profile = this.buildConnectionProfileFromFormForProbe();
+      const sshCommand = this.buildSshCommand(profile);
+      probeSessionId = this.createClientId('probe-session');
+      this.isProbingConnectionProfile = true;
+      this.probeStatus = 'Connecting and waiting for a stable prompt...';
+      this.connectionStatus = this.probeStatus;
+      this.ptyBufferBySession.set(probeSessionId, '');
+      this.registerActiveConnectionRuntime(probeSessionId, profile);
+
+      await invoke<void>('pty_create_session', {
+        sessionId: probeSessionId,
+        cols: 120,
+        rows: 40
+      });
+      this.ptySessions.add(probeSessionId);
+
+      await invoke<void>('pty_write', {
+        sessionId: probeSessionId,
+        data: this.withTerminalSubmitSequence(sshCommand)
+      });
+
+      await this.waitForProbeConnectionReady(probeSessionId);
+
+      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const startMarker = `__AI_TERMINAL_PROBE_START_${nonce}__`;
+      const endMarker = `__AI_TERMINAL_PROBE_END_${nonce}__`;
+      const probeCommand = this.buildServerProbeCommand(startMarker, endMarker);
+      const outputStartLength = (this.ptyBufferBySession.get(probeSessionId) || '').length;
+
+      this.probeStatus = 'Running read-only probe commands...';
+      this.connectionStatus = this.probeStatus;
+      await invoke<void>('pty_write', {
+        sessionId: probeSessionId,
+        data: this.withTerminalSubmitSequence(probeCommand)
+      });
+
+      const rawProbeOutput = await this.waitForProbeOutput(
+        probeSessionId,
+        outputStartLength,
+        startMarker,
+        endMarker
+      );
+      const serverContext = this.buildServerContextFromProbe(profile, rawProbeOutput, startedAt);
+      this.connectionForm.serverContext = serverContext;
+      this.connectionForm.probeRawOutput = rawProbeOutput;
+      this.connectionForm.probeUpdatedAt = startedAt;
+
+      if (this.connectionFormMode === 'edit' && this.editingConnectionProfileId) {
+        const patch: UpdateConnectionProfilePatch = {
+          serverContext,
+          probeRawOutput: rawProbeOutput,
+          probeUpdatedAt: startedAt
+        };
+        await this.persistServerContextFileForProfile(this.editingConnectionProfileId, patch);
+        if (patch.serverContextPath) {
+          this.connectionForm.serverContextPath = patch.serverContextPath;
+        }
+        this.connectionProfileService.updateProfile(this.editingConnectionProfileId, patch);
+        this.loadConnectionProfiles();
+      }
+
+      this.probeStatus = `Probe completed at ${this.formatConnectionTime(startedAt)}.`;
+      this.connectionStatus = this.probeStatus;
+    } catch (error: any) {
+      const message = error?.message || error;
+      this.probeStatus = `Probe failed: ${message}`;
+      this.connectionStatus = this.probeStatus;
+      if (probeSessionId) {
+        this.connectionForm.probeRawOutput = this.normalizeTerminalOutput(
+          this.ptyBufferBySession.get(probeSessionId) || ''
+        ).slice(-8000);
+      }
+    } finally {
+      this.isProbingConnectionProfile = false;
+      if (probeSessionId) {
+        this.activeConnectionRuntimes.delete(probeSessionId);
+        this.ptySessions.delete(probeSessionId);
+        this.pendingPtySessions.delete(probeSessionId);
+        this.ptySessionPromises.delete(probeSessionId);
+        this.ptyBufferBySession.delete(probeSessionId);
+        void invoke<void>('pty_close_session', { sessionId: probeSessionId }).catch(() => undefined);
+      }
+    }
+  }
+
+  private buildConnectionProfileFromFormForProbe(): ConnectionProfile {
+    const payload = this.formToProfileInput() as CreateConnectionProfileInput;
+    if (payload.authMethod === 'manual') {
+      throw new Error('Probe cannot run with Manual auth. Use Password, Private Key, or SSH Agent for background probing.');
+    }
+    const profile = this.connectionProfileService.createDefaultProfile({
+      ...payload,
+      name: payload.name?.trim() || 'Probe Connection',
+      type: payload.type || this.connectionForm.type
+    });
+    return {
+      ...profile,
+      id: this.editingConnectionProfileId || this.createClientId('probe-profile')
+    };
+  }
+
+  private async waitForProbeConnectionReady(
+    sessionId: string,
+    timeoutMs: number = 30000,
+    quietMs: number = 3500
+  ): Promise<void> {
+    const startedAt = Date.now();
+    let lastLength = (this.ptyBufferBySession.get(sessionId) || '').length;
+    let lastChangedAt = startedAt;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      await this.sleep(200);
+      const output = this.normalizeTerminalOutput(this.ptyBufferBySession.get(sessionId) || '');
+      if (this.hasProbeConnectionFailure(output)) {
+        throw new Error(`Connection failed before probe could run.\n${output.slice(-1200)}`);
+      }
+
+      if (this.hasPasswordPrompt(output)) {
+        lastChangedAt = Date.now();
+        continue;
+      }
+
+      const runtime = this.activeConnectionRuntimes.get(sessionId);
+      if (runtime?.profileSnapshot?.authMethod === 'password' && !runtime.passwordAttempted) {
+        lastChangedAt = Date.now();
+        continue;
+      }
+
+      const currentLength = output.length;
+      if (currentLength !== lastLength) {
+        lastLength = currentLength;
+        lastChangedAt = Date.now();
+      }
+
+      if (currentLength > 0 && Date.now() - lastChangedAt >= quietMs) {
+        return;
+      }
+    }
+
+    throw new Error(`Timed out waiting for SSH/JumpServer prompt.\n${this.getPtyOutputTail(sessionId)}`);
+  }
+
+  private async waitForProbeOutput(
+    sessionId: string,
+    outputStartLength: number,
+    startMarker: string,
+    endMarker: string,
+    timeoutMs: number = 30000
+  ): Promise<string> {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeoutMs) {
+      await this.sleep(200);
+      const output = this.normalizeTerminalOutput(
+        (this.ptyBufferBySession.get(sessionId) || '').slice(outputStartLength)
+      );
+      if (this.hasProbeConnectionFailure(output)) {
+        throw new Error(`Probe command failed because the connection ended.\n${output.slice(-1200)}`);
+      }
+
+      const startIndex = output.indexOf(startMarker);
+      const endIndex = output.indexOf(endMarker);
+      if (startIndex >= 0 && endIndex > startIndex) {
+        return output
+          .slice(startIndex + startMarker.length, endIndex)
+          .replace(/\r/g, '')
+          .trim();
+      }
+    }
+
+    throw new Error(`Timed out waiting for probe output.\n${this.getPtyOutputTail(sessionId)}`);
+  }
+
+  private buildServerProbeCommand(startMarker: string, endMarker: string): string {
+    const startNonce = startMarker.replace('__AI_TERMINAL_PROBE_START_', '').replace('__', '');
+    const endNonce = endMarker.replace('__AI_TERMINAL_PROBE_END_', '').replace('__', '');
+    return [
+      `printf '%s%s%s\\n' '__AI_TERMINAL_' 'PROBE_START_' '${startNonce}__'`,
+      `printf 'hostname='; (hostname 2>/dev/null || uname -n 2>/dev/null || true)`,
+      `printf 'kernel='; (uname -srmo 2>/dev/null || uname -a 2>/dev/null || true)`,
+      `printf 'os='; (sh -c '. /etc/os-release 2>/dev/null && printf "%s %s\\n" "$PRETTY_NAME" "$VERSION_ID"' 2>/dev/null || head -n 1 /etc/issue 2>/dev/null || true)`,
+      `printf 'arch='; (uname -m 2>/dev/null || true)`,
+      `printf 'shell='; printf '%s\\n' "$SHELL"`,
+      `printf 'user='; (id -un 2>/dev/null || whoami 2>/dev/null || true)`,
+      `printf 'pwd='; (pwd 2>/dev/null || true)`,
+      `printf 'id='; (id 2>/dev/null || true)`,
+      `printf 'cpu='; (lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p;s/^Architecture:[[:space:]]*/Architecture: /p' | head -n 3 || true)`,
+      `printf 'memory='; (free -h 2>/dev/null | sed -n '1,2p' || true)`,
+      `printf 'package_managers='; for c in apt yum dnf zypper apk pacman brew; do command -v "$c" >/dev/null 2>&1 && printf '%s ' "$c"; done; printf '\\n'`,
+      `printf '%s%s%s\\n' '__AI_TERMINAL_' 'PROBE_END_' '${endNonce}__'`
+    ].join('; ');
+  }
+
+  private buildServerContextFromProbe(
+    profile: ConnectionProfile,
+    rawProbeOutput: string,
+    probedAt: string
+  ): string {
+    const target = this.getSshUserHost(profile) || profile.targetHost || profile.jumpHost || profile.name;
+    const jump = profile.type === 'jumpserver' && profile.jumpHost
+      ? ` via ${profile.jumpUser ? `${profile.jumpUser}@` : ''}${profile.jumpHost}`
+      : '';
+    return [
+      `Profile: ${profile.name}`,
+      `Connection type: ${this.getConnectionTypeLabel(profile.type)}`,
+      `Target: ${target}${jump}`,
+      `Probe updated at: ${probedAt}`,
+      'Shell guidance: use POSIX/Linux shell commands for this profile unless the details below clearly indicate otherwise.',
+      '',
+      'Probe result:',
+      rawProbeOutput
+    ].join('\n');
+  }
+
+  private hasProbeConnectionFailure(output: string): boolean {
+    return /(?:Permission denied|Connection refused|Could not resolve hostname|Name or service not known|No route to host|Connection timed out|Operation timed out|Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|Too many authentication failures)/i.test(output);
+  }
+
+  private sleep(milliseconds: number): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+  }
+
   async connectConnectionProfile(profile: ConnectionProfile): Promise<void> {
     const displayName = this.generateConnectionDisplayName(profile);
     let sessionId = '';
 
     try {
       const sshCommand = this.buildSshCommand(profile);
-      sessionId = this.createNewSession(displayName, true, profile.id);
+      sessionId = this.createNewSession(
+        displayName,
+        true,
+        profile.id,
+        profile.type === 'jumpserver' ? 'jumpserver' : 'ssh'
+      );
       this.registerActiveConnectionRuntime(sessionId, profile);
       await this.ensurePtySession(sessionId);
       await invoke<void>('pty_write', {
@@ -1052,6 +2446,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       terminalSessionId: sessionId,
       profileId: profile.id,
       profileType: profile.type,
+      profileSnapshot: { ...profile, autoInputRules: profile.autoInputRules.map((rule) => ({ ...rule })) },
       passwordAttempted: false,
       pendingAutoInputRuleIds: [],
       firedAutoInputRuleIds: [],
@@ -1074,7 +2469,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    const profile = this.connectionProfileService.getProfile(runtime.profileId);
+    const profile = this.getConnectionRuntimeProfile(runtime);
     if (!profile || profile.authMethod !== 'password') {
       return;
     }
@@ -1132,7 +2527,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       throw new Error('Target host is required for SSH connections.');
     }
 
-    const commandParts = ['ssh'];
+    const commandParts = this.createBaseSshCommandParts();
     if (profile.authMethod === 'privateKey' && profile.privateKeyPath?.trim()) {
       commandParts.push('-i', this.quoteShellArg(profile.privateKeyPath.trim()));
     }
@@ -1152,7 +2547,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       throw new Error('JumpServer host is required for JumpServer connections.');
     }
 
-    const commandParts = ['ssh'];
+    const commandParts = this.createBaseSshCommandParts();
     if (profile.authMethod === 'privateKey' && profile.privateKeyPath?.trim()) {
       commandParts.push('-i', this.quoteShellArg(profile.privateKeyPath.trim()));
     }
@@ -1166,12 +2561,16 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     return commandParts.join(' ');
   }
 
+  private createBaseSshCommandParts(): string[] {
+    return ['ssh', '-o', 'StrictHostKeyChecking=accept-new'];
+  }
+
   private async handleJumpServerAutoInputRules(runtime: ActiveConnectionRuntime): Promise<void> {
     if (runtime.profileType !== 'jumpserver') {
       return;
     }
 
-    const profile = this.connectionProfileService.getProfile(runtime.profileId);
+    const profile = this.getConnectionRuntimeProfile(runtime);
     if (!profile) {
       return;
     }
@@ -1230,6 +2629,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     return profile.targetHost?.trim() || '';
+  }
+
+  private getConnectionRuntimeProfile(runtime: ActiveConnectionRuntime): ConnectionProfile | undefined {
+    return runtime.profileSnapshot || this.connectionProfileService.getProfile(runtime.profileId);
   }
 
   private normalizeTerminalOutput(output: string): string {
@@ -1331,6 +2734,43 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     };
   }
 
+  private getTerminalAssistantEnvironmentContext(
+    sessionId: string = this.activeSessionId
+  ): TerminalAssistantEnvironmentContext | undefined {
+    const session = this.terminalSessions.find((candidate) => candidate.id === sessionId);
+    if (!session?.connectionProfileId) {
+      if (session?.terminalKind === 'local-wsl') {
+        return {
+          terminalKind: session.terminalKind,
+          wslDistroName: session.wslDistroName
+        };
+      }
+
+      if (session?.terminalKind === 'local-zsh') {
+        return {
+          terminalKind: session.terminalKind
+        };
+      }
+
+      return undefined;
+    }
+
+    const profile = this.connectionProfileService.getProfile(session.connectionProfileId);
+    if (!profile) {
+      return undefined;
+    }
+
+    return {
+      terminalKind: session.terminalKind,
+      connectionType: profile.type === 'jumpserver' ? 'JumpServer SSH' : 'SSH',
+      profileName: profile.name,
+      targetHost: profile.targetHost,
+      targetUser: profile.targetUser,
+      wslDistroName: session.wslDistroName,
+      serverContext: profile.serverContext
+    };
+  }
+
   formatConnectionTime(value?: string): string {
     if (!value) {
       return 'Never';
@@ -1346,6 +2786,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   trackByConnectionProfileId(_: number, profile: ConnectionProfile): string {
     return profile.id;
+  }
+
+  trackByTerminalProfileId(_: number, item: TerminalProfileViewItem): string {
+    return item.id;
   }
 
   trackByAutoInputRuleId(_: number, rule: AutoInputRule): string {
@@ -1368,7 +2812,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       privateKeyPath: '',
       autoInputRules: [],
       tagsText: '',
-      description: ''
+      description: '',
+      serverContext: '',
+      serverContextPath: '',
+      probeRawOutput: '',
+      probeUpdatedAt: ''
     };
   }
 
@@ -1388,7 +2836,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       privateKeyPath: profile.privateKeyPath || '',
       autoInputRules: profile.autoInputRules.map((rule) => ({ ...rule })),
       tagsText: profile.tags.join(', '),
-      description: profile.description || ''
+      description: profile.description || '',
+      serverContext: profile.serverContext || '',
+      serverContextPath: profile.serverContextPath || '',
+      probeRawOutput: profile.probeRawOutput || '',
+      probeUpdatedAt: profile.probeUpdatedAt || ''
     };
   }
 
@@ -1411,7 +2863,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         .split(',')
         .map((tag) => tag.trim())
         .filter((tag) => tag.length > 0),
-      description: this.emptyToUndefined(this.connectionForm.description)
+      description: this.emptyToUndefined(this.connectionForm.description),
+      serverContext: this.rawEmptyToUndefined(this.connectionForm.serverContext),
+      serverContextPath: this.emptyToUndefined(this.connectionForm.serverContextPath),
+      probeRawOutput: this.rawEmptyToUndefined(this.connectionForm.probeRawOutput),
+      probeUpdatedAt: this.emptyToUndefined(this.connectionForm.probeUpdatedAt)
     };
   }
 
@@ -1454,38 +2910,205 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   sendCodeToTerminal(code: string): void {
     const command = this.transformCodeForDisplay(code);
     if (this.activeSessionId) {
-      invoke<void>('pty_write', { sessionId: this.activeSessionId, data: command }).catch((error) => {
+      this.writeToPtySession(this.activeSessionId, command).catch((error) => {
         console.error('Failed to send command to PTY:', error);
       });
     }
     this.focusTerminalInput();
 
-    // Show a brief notification
-    const notification = document.createElement('div');
-    notification.className = 'copy-notification';
-    notification.textContent = 'Copied to terminal';
-    document.body.appendChild(notification);
+    this.showCopiedNotification('Copied to terminal');
+  }
 
-    // Animate and remove notification
-    setTimeout(() => {
-      notification.classList.add('show');
-      setTimeout(() => {
-        notification.classList.remove('show');
-        setTimeout(() => {
-          document.body.removeChild(notification);
-        }, 300);
-      }, 1200);
-    }, 10);
+  sendSuggestionToTerminal(suggestion: CommandSuggestion): void {
+    this.sendCodeToTerminal(suggestion.command);
+  }
+
+  private createCommandExecutionForSuggestion(
+    command: string,
+    suggestion?: CommandSuggestion
+  ): CommandExecution | undefined {
+    if (!suggestion || !this.activeSessionId) {
+      return undefined;
+    }
+
+    const conversation = this.aiConversationService.getConversation(suggestion.conversationId);
+    if (!conversation) {
+      console.warn(`Could not find conversation for suggestion ${suggestion.id}.`);
+      return undefined;
+    }
+
+    const execution = this.aiConversationService.createCommandExecution({
+      conversationId: conversation.id,
+      suggestionId: suggestion.id,
+      terminalSessionId: this.activeSessionId,
+      command
+    });
+    this.syncAiConversationState();
+
+    return execution;
+  }
+
+  private markCommandExecutionRunning(execution?: CommandExecution): void {
+    if (!execution) {
+      return;
+    }
+
+    this.aiConversationService.markCommandExecutionRunning(execution.id);
+    this.syncAiConversationState();
+  }
+
+  private markCommandExecutionFailed(execution?: CommandExecution): void {
+    if (!execution) {
+      return;
+    }
+
+    this.aiConversationService.markCommandExecutionFailed(execution.id);
+    this.syncAiConversationState();
+  }
+
+  private createRunningExecutionState(
+    execution: CommandExecution,
+    terminalSessionId: string,
+    command: string
+  ): RunningExecutionState {
+    const markerId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    return {
+      executionId: execution.id,
+      terminalSessionId,
+      command,
+      wrappedCommand: '',
+      markerId,
+      startMarker: `__AI_TERMINAL_COMMAND_START_${markerId}__`,
+      doneMarker: `__AI_TERMINAL_COMMAND_DONE_${markerId}__`,
+      outputBuffer: ''
+    };
+  }
+
+  private buildMarkedCommand(command: string, runningExecution: RunningExecutionState): string {
+    if (this.shouldUsePowerShellCommandMarker()) {
+      return this.buildPowerShellMarkedCommand(command, runningExecution.markerId);
+    }
+
+    return this.buildPosixMarkedCommand(command, runningExecution.markerId);
+  }
+
+  private buildPosixMarkedCommand(command: string, markerId: string): string {
+    const commandToRun = this.quotePosixShellValue(this.normalizeCommandForMarkedExecution(command));
+    return [
+      `__ait_marker_id='${markerId}'`,
+      `printf '\\n__AI_TERMINAL_COMMAND_START_%s__\\n' "$__ait_marker_id"`,
+      `eval ${commandToRun}`,
+      '__ait_exit_code=$?',
+      `printf '\\n__AI_TERMINAL_COMMAND_DONE_%s__:%s\\n' "$__ait_marker_id" "$__ait_exit_code"`,
+      'unset __ait_marker_id __ait_exit_code'
+    ].join('; ');
+  }
+
+  private buildPowerShellMarkedCommand(command: string, markerId: string): string {
+    const commandToRun = this.quotePowerShellSingleQuotedValue(
+      this.normalizeCommandForMarkedExecution(command)
+    );
+    return [
+      `$__aitMarkerId = '${markerId}'`,
+      'Write-Output ("__AI_TERMINAL_COMMAND_START_{0}__" -f $__aitMarkerId)',
+      `& ([scriptblock]::Create(${commandToRun}))`,
+      '$__aitSuccess = $?',
+      '$__aitNativeExitCode = $LASTEXITCODE',
+      '$__aitExitCode = if ($null -ne $__aitNativeExitCode) { $__aitNativeExitCode } elseif ($__aitSuccess) { 0 } else { 1 }',
+      'Write-Output ("__AI_TERMINAL_COMMAND_DONE_{0}__:{1}" -f $__aitMarkerId, $__aitExitCode)',
+      'Remove-Variable __aitMarkerId, __aitSuccess, __aitNativeExitCode, __aitExitCode -ErrorAction SilentlyContinue'
+    ].join('; ');
+  }
+
+  private shouldUsePowerShellCommandMarker(): boolean {
+    if (this.detectOperatingSystem() !== 'Windows') {
+      return false;
+    }
+
+    const activeSession = this.terminalSessions.find((session) => session.id === this.activeSessionId);
+    return activeSession?.terminalKind !== 'local-wsl' && !activeSession?.connectionProfileId;
+  }
+
+  private normalizeCommandForMarkedExecution(command: string): string {
+    return command
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join('; ');
+  }
+
+  private quotePosixShellValue(value: string): string {
+    return `'${value.replace(/'/g, `'\\''`)}'`;
+  }
+
+  private quotePowerShellSingleQuotedValue(value: string): string {
+    return `'${value.replace(/'/g, `''`)}'`;
+  }
+
+  private shouldCollectCommandExecution(command: string): boolean {
+    const trimmedCommand = command.trim();
+    return Boolean(trimmedCommand) &&
+      !/[\r\n]/.test(trimmedCommand) &&
+      !this.isLikelyInteractiveCommand(trimmedCommand);
+  }
+
+  private isLikelyInteractiveCommand(command: string): boolean {
+    const firstCommand = command
+      .replace(/^\s*(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*/, '')
+      .replace(/^\s*(?:sudo\s+)+/, '')
+      .split(/[;&|]/)[0]
+      .trim();
+
+    return (
+      /^(?:ssh|sshpass|sftp|scp|mosh)\b/.test(firstCommand) ||
+      /^(?:top|htop|less|more|man|vi|vim|nano|emacs|watch)\b/.test(firstCommand) ||
+      /^tail\b.*\s-f(?:\s|$)/.test(firstCommand) ||
+      /^(?:mysql|psql|redis-cli|mongo|mongosh)\b(?:\s*)$/.test(firstCommand) ||
+      /^(?:python|python3|node|irb|rails\s+console|php\s+-a)\b(?:\s*)$/.test(firstCommand)
+    );
   }
 
   // Method to execute code directly
-  executeCodeDirectly(code: string): void {
+  async executeCodeDirectly(
+    code: string,
+    options: ExecuteTerminalCommandOptions = {}
+  ): Promise<void> {
     const command = this.transformCodeForDisplay(code);
-    const commandWithSubmit = this.withTerminalSubmitSequence(command);
-    if (this.activeSessionId) {
-      invoke<void>('pty_write', { sessionId: this.activeSessionId, data: commandWithSubmit }).catch((error) => {
+    const activeSessionId = this.activeSessionId;
+    if (activeSessionId && options.suggestion && this.runningExecutionStatesBySession.has(activeSessionId)) {
+      console.warn('A command execution is already running in this terminal session.');
+      return;
+    }
+
+    const shouldCollectExecution = Boolean(options.suggestion) && this.shouldCollectCommandExecution(command);
+    const execution = shouldCollectExecution
+      ? this.createCommandExecutionForSuggestion(command, options.suggestion)
+      : undefined;
+
+    if (activeSessionId) {
+      const runningExecution = execution
+        ? this.createRunningExecutionState(execution, activeSessionId, command)
+        : undefined;
+      const commandToExecute = command;
+      if (runningExecution) {
+        runningExecution.wrappedCommand = commandToExecute;
+      }
+      const commandWithSubmit = this.withTerminalSubmitSequence(commandToExecute);
+
+      try {
+        if (runningExecution) {
+          this.runningExecutionStatesBySession.set(activeSessionId, runningExecution);
+          this.markCommandExecutionRunning(execution);
+        }
+        await this.writeToPtySession(activeSessionId, commandWithSubmit);
+      } catch (error) {
+        if (runningExecution) {
+          this.runningExecutionStatesBySession.delete(activeSessionId);
+        }
+        this.markCommandExecutionFailed(execution);
         console.error('Failed to execute command in PTY:', error);
-      });
+      }
+
       // Track command in history for LLM context
       this.commandHistory.push({
         command,
@@ -1501,6 +3124,97 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  executeSuggestionDirectly(suggestion: CommandSuggestion): void {
+    void this.executeCodeDirectly(suggestion.command, { suggestion });
+  }
+
+  getExecutionsForSuggestion(
+    conversation: AiConversation,
+    suggestionId: string
+  ): CommandExecution[] {
+    return conversation.executions.filter((execution) => execution.suggestionId === suggestionId);
+  }
+
+  trackByCommandExecutionId(_: number, execution: CommandExecution): string {
+    return execution.id;
+  }
+
+  getCommandExecutionStatusLabel(execution: CommandExecution): string {
+    if (typeof execution.exitCode === 'number') {
+      return `${execution.status} (${execution.exitCode})`;
+    }
+
+    if (execution.status === 'success') {
+      return 'completed';
+    }
+
+    return execution.status;
+  }
+
+  getCommandExecutionTimeLabel(execution: CommandExecution): string {
+    const timestamp = execution.finishedAt || execution.startedAt;
+    return new Date(timestamp).toLocaleString();
+  }
+
+  getCommandExecutionPreview(execution: CommandExecution): string {
+    const output = (execution.editableOutput ?? execution.outputPreview ?? execution.rawOutput).trim();
+    if (!output) {
+      return execution.status === 'running' ? 'Collecting output...' : '(no output)';
+    }
+
+    const lines = output.split('\n');
+    const preview = lines.slice(0, 6).join('\n');
+    const suffix = lines.length > 6 || preview.length < output.length ? '\n...' : '';
+    return `${preview}${suffix}`;
+  }
+
+  getCommandExecutionEditableOutput(execution: CommandExecution): string {
+    return execution.editableOutput ?? execution.rawOutput;
+  }
+
+  toggleCommandExecutionCollapsed(execution: CommandExecution): void {
+    const patch: Partial<CommandExecution> = {
+      collapsed: !execution.collapsed
+    };
+
+    if (execution.collapsed && execution.editableOutput === undefined) {
+      patch.editableOutput = execution.rawOutput;
+    }
+
+    this.aiConversationService.updateCommandExecution(execution.id, patch);
+    this.syncAiConversationState();
+  }
+
+  updateCommandExecutionEditableOutput(execution: CommandExecution, value: string): void {
+    this.aiConversationService.updateCommandExecution(execution.id, {
+      editableOutput: value
+    });
+    this.syncAiConversationState();
+  }
+
+  setCommandExecutionIncludedInContext(execution: CommandExecution, includedInContext: boolean): void {
+    this.aiConversationService.updateCommandExecution(execution.id, {
+      includedInContext,
+      contextMode: includedInContext ? 'full' : 'none'
+    });
+    this.syncAiConversationState();
+  }
+
+  async copyCommandExecutionOutput(execution: CommandExecution): Promise<void> {
+    await this.copyToClipboard(this.getCommandExecutionEditableOutput(execution));
+    this.showCopiedNotification('Output copied');
+  }
+
+  deleteCommandExecution(execution: CommandExecution): void {
+    const runningExecution = this.runningExecutionStatesBySession.get(execution.terminalSessionId);
+    if (runningExecution?.executionId === execution.id) {
+      this.runningExecutionStatesBySession.delete(execution.terminalSessionId);
+    }
+
+    this.aiConversationService.removeCommandExecution(execution.id);
+    this.syncAiConversationState();
+  }
+
   toggleAIPanel(): void {
     this.isAIPanelVisible = !this.isAIPanelVisible;
     if (this.terminal && this.fitAddon) {
@@ -1512,13 +3226,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   createNewSession(
     name?: string,
     setAsActive: boolean = false,
-    connectionProfileId?: string
+    connectionProfileId?: string,
+    terminalKind?: TerminalProfileKind,
+    wslDistroName?: string
   ): string {
     const { sessions, sessionId, shouldActivate } = this.terminalSessionService.createNewSession(
       this.terminalSessions,
       name,
       setAsActive,
-      connectionProfileId
+      connectionProfileId,
+      terminalKind,
+      wslDistroName
     );
     this.terminalSessions = sessions;
 
@@ -1555,6 +3273,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     this.activeSessionId = sessionId;
     this.scrollSessionTabIntoView(sessionId);
+    this.syncAiConversationState();
 
     // Restore session state
     this.restoreSessionState(targetSession);
@@ -1562,6 +3281,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       void this.ensurePtySession(sessionId).then(() => {
         this.renderActivePtyBuffer();
         this.resizeInteractiveTerminal();
+        this.focusTerminalInput();
       }).catch((error) => {
         console.error(`Failed to initialize PTY for ${sessionId}:`, error);
       });
@@ -1618,6 +3338,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.ptySessionPromises.delete(sessionId);
       this.activeConnectionRuntimes.delete(sessionId);
       this.ptyBufferBySession.delete(sessionId);
+      this.failRunningExecutionForSession(sessionId);
     }
 
     if (nextActiveSessionId) {
@@ -1658,10 +3379,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   trackBySessionId(_: number, session: TerminalSession): string {
     return session.id;
-  }
-
-  trackByChatEntry(index: number, entry: ChatHistory): string {
-    return `${entry.timestamp.getTime()}-${index}`;
   }
 
   trackByResponseSegment(index: number, segment: string): string {

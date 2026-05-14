@@ -16,15 +16,42 @@
           </div>
         </div>
         <div class="terminal-toolbar">
-          <button class="new-tab" (click)="createNewSession(undefined, true)" title="New tab">
-            +
-          </button>
+          <div class="new-terminal-menu">
+            <button class="new-tab" (click)="openDefaultTerminalSession()" title="New terminal">
+              +
+            </button>
+            <button
+              class="new-tab-dropdown"
+              type="button"
+              (click)="toggleTerminalLauncher($event)"
+              title="Choose terminal"
+              aria-label="Choose terminal"
+            >
+              ▾
+            </button>
+            <div class="terminal-launcher-menu" *ngIf="isTerminalLauncherOpen" (click)="$event.stopPropagation()">
+              <div class="terminal-launcher-section">
+                <div class="terminal-launcher-title">Open Terminals</div>
+                <button
+                  class="terminal-launcher-item"
+                  type="button"
+                  *ngFor="let session of terminalSessions; trackBy: trackBySessionId"
+                  [ngClass]="{'active': session.id === activeSessionId}"
+                  [title]="session.name"
+                  (click)="selectTerminalFromLauncher(session.id)"
+                >
+                  <span class="terminal-launcher-name">{{ session.name }}</span>
+                  <span class="terminal-launcher-kind">{{ session.id === activeSessionId ? 'Active' : getTerminalSessionKindLabel(session) }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
           <button
             class="connection-toolbar-button"
             type="button"
             (click)="openConnectionManager()"
-            title="Manage connection profiles"
-            aria-label="Manage connection profiles"
+            title="Manage terminal profiles"
+            aria-label="Manage terminal profiles"
           >
             <app-icon name="connection" [size]="16"></app-icon>
           </button>
@@ -40,7 +67,7 @@
       </div>
 
       <div class="output-area terminal-output-area">
-        <div class="xterm-wrapper" #terminalContainer></div>
+        <div class="xterm-wrapper" #terminalContainer (mousedown)="focusTerminalInput()"></div>
       </div>
     </div>
   </div>
@@ -77,54 +104,204 @@
 
       <div class="output-area" *ngIf="activeAiView === 'chat'">
         <div class="chat-history">
-          <div *ngFor="let entry of chatHistory; trackBy: trackByChatEntry" class="chat-entry">
-            <!-- Add question display -->
-            <div class="chat-question">
-              <span class="message"><b>{{ entry.message }}</b></span>
+          <div class="empty-chat-state" *ngIf="aiConversations.length === 0">
+            No AI sessions yet.
+          </div>
+
+          <section
+            class="conversation-card"
+            *ngFor="let conversation of aiConversations; trackBy: trackByAiConversationId"
+            [class.active]="conversation.id === activeAiConversationId"
+            (click)="continueAiConversation(conversation.id)"
+          >
+            <div class="conversation-card-header">
+              <div class="conversation-card-main">
+                <div class="conversation-title">{{ conversation.title }}</div>
+                <div class="conversation-meta">
+                  {{ getConversationSessionName(conversation) }} · {{ getConversationMessageCount(conversation) }} messages
+                </div>
+              </div>
+              <button
+                class="conversation-select-button"
+                type="button"
+                (click)="continueAiConversation(conversation.id); $event.stopPropagation()"
+              >
+                {{ conversation.id === activeAiConversationId ? 'Selected' : 'Continue' }}
+              </button>
             </div>
-            <div class="chat-output">
-              <ng-container *ngFor="let segment of entry.response.split('\n'); trackBy: trackByResponseSegment">
-                <!-- Check if segment is a code block placeholder -->
-                <ng-container *ngIf="isCodeBlockPlaceholder(segment) && entry.codeBlocks">
-                  <!-- Get the index of the code block -->
-                  <ng-container *ngIf="getCodeBlockIndex(segment) >= 0">
-                    <!-- Simple command display -->
-                    <div class="command-block">
-                      <div class="command-content">
-                        <span class="simple-command">
-                          <span class="command-text">
-                            {{ transformCodeForDisplay(entry.codeBlocks[getCodeBlockIndex(segment)].code) }}
-                          </span>
-                          <span class="command-actions">
-                            <button class="command-action-button" data-tooltip="Copy"
-                              (click)="copyCodeBlock(entry.codeBlocks[getCodeBlockIndex(segment)].code)">
-                              <app-icon name="copy" [size]="12"></app-icon>
-                            </button>
-                            <button class="command-action-button" data-tooltip="Copy to terminal"
-                              (click)="sendCodeToTerminal(entry.codeBlocks[getCodeBlockIndex(segment)].code)">
-                              <app-icon name="copy-to-terminal" [size]="12"></app-icon>
-                            </button>
-                            <button class="command-action-button" data-tooltip="Execute"
-                              (click)="executeCodeDirectly(entry.codeBlocks[getCodeBlockIndex(segment)].code)">
-                              <app-icon name="execute" [size]="12"></app-icon>
-                            </button>
-                          </span>
-                        </span>
-                        <span class="command-explanation"
-                          *ngIf="getCommandExplanation(entry.codeBlocks[getCodeBlockIndex(segment)].code)">
-                          {{ getCommandExplanation(entry.codeBlocks[getCodeBlockIndex(segment)].code) }}
-                        </span>
-                      </div>
-                    </div>
+
+            <div
+              *ngFor="let message of conversation.messages; trackBy: trackByAiMessageId"
+              class="chat-entry"
+              [class.chat-entry-user]="message.role === 'user'"
+              [class.chat-entry-ai]="message.role === 'assistant'"
+              [class.chat-entry-system]="message.role === 'system'"
+            >
+              <div class="chat-output">
+                <span class="chat-message-label">{{ getAiMessageLabel(message) }}:</span>
+                <ng-container *ngIf="message.role === 'assistant'; else plainMessage">
+                  <ng-container *ngFor="let segment of message.content.split('\n'); trackBy: trackByResponseSegment">
+                    <ng-container *ngIf="isCodeBlockPlaceholder(segment)">
+                      <ng-container *ngIf="getMessageSuggestion(message, segment) as suggestion">
+                        <div class="command-block">
+                          <div class="command-content">
+                            <span class="simple-command">
+                              <span class="command-text">
+                                {{ suggestion.command }}
+                              </span>
+                              <span class="command-actions">
+                                <button class="command-action-button" data-tooltip="Copy"
+                                  (click)="copyCommandSuggestion(suggestion); $event.stopPropagation()">
+                                  <app-icon name="copy" [size]="12"></app-icon>
+                                </button>
+                                <button class="command-action-button" data-tooltip="Copy to terminal"
+                                  (click)="sendSuggestionToTerminal(suggestion); $event.stopPropagation()">
+                                  <app-icon name="copy-to-terminal" [size]="12"></app-icon>
+                                </button>
+                                <button class="command-action-button" data-tooltip="Execute"
+                                  (click)="executeSuggestionDirectly(suggestion); $event.stopPropagation()">
+                                  <app-icon name="execute" [size]="12"></app-icon>
+                                </button>
+                                <button class="command-action-button" data-tooltip="Explain"
+                                  (click)="toggleCommandExplanation(suggestion); $event.stopPropagation()">
+                                  <app-icon name="ai-explain" [size]="12"></app-icon>
+                                </button>
+                              </span>
+                            </span>
+                            <span class="command-explanation"
+                              *ngIf="suggestion.explanation">
+                              {{ suggestion.explanation }}
+                            </span>
+                          </div>
+                          <ng-container *ngIf="getCommandExplanationState(suggestion) as explanationState">
+                            <div class="command-ai-explanation" *ngIf="explanationState.isOpen" (click)="$event.stopPropagation()">
+                              <div class="command-ai-explanation-turns" *ngIf="explanationState.turns.length > 0">
+                                <div
+                                  class="command-ai-explanation-turn"
+                                  *ngFor="let turn of explanationState.turns"
+                                  [class.user-turn]="turn.role === 'user'"
+                                >
+                                  <span class="command-ai-explanation-role">{{ turn.role === 'user' ? 'You:' : 'AI:' }}</span>
+                                  <span class="command-ai-explanation-content">{{ turn.content }}</span>
+                                </div>
+                              </div>
+                              <div class="command-ai-explanation-loading" *ngIf="explanationState.isLoading">
+                                AI is explaining...
+                              </div>
+                              <div class="command-ai-explanation-error" *ngIf="explanationState.error">
+                                {{ explanationState.error }}
+                              </div>
+                              <div class="command-ai-explanation-followup">
+                                <textarea
+                                  [ngModel]="explanationState.followUpQuestion"
+                                  (ngModelChange)="updateCommandExplanationFollowUp(suggestion.id, $event)"
+                                  (keydown)="onCommandExplanationFollowUpKeydown($event, suggestion)"
+                                  [disabled]="explanationState.isLoading"
+                                  placeholder="Ask a follow-up about this command..."
+                                  rows="2"
+                                ></textarea>
+                                <button
+                                  class="command-ai-followup-button"
+                                  type="button"
+                                  (click)="submitCommandExplanationFollowUp(suggestion)"
+                                  [disabled]="explanationState.isLoading || !explanationState.followUpQuestion.trim()"
+                                >
+                                  Ask
+                                </button>
+                              </div>
+                            </div>
+                          </ng-container>
+                          <div
+                            class="execution-attachments"
+                            *ngIf="getExecutionsForSuggestion(conversation, suggestion.id).length > 0"
+                            (click)="$event.stopPropagation()"
+                          >
+                            <div
+                              class="execution-attachment"
+                              *ngFor="let execution of getExecutionsForSuggestion(conversation, suggestion.id); trackBy: trackByCommandExecutionId"
+                              [class.execution-running]="execution.status === 'running'"
+                              [class.execution-success]="execution.status === 'success'"
+                              [class.execution-failed]="execution.status === 'failed'"
+                            >
+                              <div class="execution-attachment-header">
+                                <div class="execution-attachment-main">
+                                  <div class="execution-attachment-title">Execution result</div>
+                                  <div class="execution-attachment-meta">
+                                    {{ getCommandExecutionStatusLabel(execution) }} · {{ getCommandExecutionTimeLabel(execution) }}
+                                  </div>
+                                </div>
+                                <div class="execution-attachment-actions">
+                                  <label class="execution-context-toggle" title="Include this result in follow-up AI requests">
+                                    <input
+                                      type="checkbox"
+                                      [ngModel]="execution.includedInContext"
+                                      (ngModelChange)="setCommandExecutionIncludedInContext(execution, $event)"
+                                      [disabled]="execution.status === 'running' || execution.status === 'pending'"
+                                    />
+                                    <span>Send to AI</span>
+                                  </label>
+                                  <button
+                                    class="execution-action-button"
+                                    type="button"
+                                    (click)="toggleCommandExecutionCollapsed(execution)"
+                                  >
+                                    {{ execution.collapsed ? 'Expand' : 'Collapse' }}
+                                  </button>
+                                  <button
+                                    class="execution-action-button"
+                                    type="button"
+                                    (click)="copyCommandExecutionOutput(execution)"
+                                    [disabled]="execution.status === 'running' || execution.status === 'pending'"
+                                  >
+                                    Copy
+                                  </button>
+                                  <button
+                                    class="execution-action-button danger"
+                                    type="button"
+                                    (click)="deleteCommandExecution(execution)"
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              </div>
+                              <pre class="execution-preview" *ngIf="execution.collapsed">{{ getCommandExecutionPreview(execution) }}</pre>
+                              <textarea
+                                class="execution-output-editor"
+                                *ngIf="!execution.collapsed"
+                                [ngModel]="getCommandExecutionEditableOutput(execution)"
+                                (ngModelChange)="updateCommandExecutionEditableOutput(execution, $event)"
+                                [readonly]="execution.status === 'running' || execution.status === 'pending'"
+                                spellcheck="false"
+                              ></textarea>
+                            </div>
+                          </div>
+                        </div>
+                      </ng-container>
+                    </ng-container>
+
+                    <div *ngIf="!isCodeBlockPlaceholder(segment)" [innerHTML]="sanitizeHtml(segment)"></div>
                   </ng-container>
                 </ng-container>
 
-                <!-- Regular text lines -->
-                <div *ngIf="!isCodeBlockPlaceholder(segment)" [innerHTML]="sanitizeHtml(segment)"></div>
-              </ng-container>
+                <ng-template #plainMessage>
+                  <div [innerHTML]="sanitizeHtml(message.content)"></div>
+                </ng-template>
+              </div>
             </div>
-          </div>
+          </section>
         </div>
+      </div>
+
+      <div class="conversation-strip" *ngIf="activeAiView === 'chat'">
+        <button class="new-conversation-button" type="button" (click)="createNewAiConversation()">
+          New Chat
+        </button>
+        <div class="conversation-mode-label" *ngIf="activeAiConversation; else newConversationMode">
+          Continuing {{ activeAiConversation.title }}
+        </div>
+        <ng-template #newConversationMode>
+          <div class="conversation-mode-label">Next question starts a new AI session</div>
+        </ng-template>
       </div>
 
       <div class="settings-view output-area" *ngIf="activeAiView === 'settings'">
@@ -193,19 +370,41 @@
       <div class="input-area" *ngIf="activeAiView === 'chat'">
         <div class="prompt-container">
           <textarea [(ngModel)]="currentQuestion" (keydown)="askAI($event)" (input)="autoResize($event)"
-            [disabled]="isProcessingAI" placeholder="Ask AI or type /help..." autofocus spellcheck="false"></textarea>
+            [disabled]="isProcessingAI"
+            [placeholder]="activeAiConversation ? 'Continue selected AI session...' : 'Ask AI or type /help...'"
+            autofocus spellcheck="false"></textarea>
+          <button
+            class="ai-run-button"
+            type="button"
+            (click)="onAiRunButtonClick()"
+            [class.stop]="isProcessingAI"
+            [disabled]="!isProcessingAI && !currentQuestion.trim()"
+            [attr.aria-label]="isProcessingAI ? 'Stop AI response' : 'Send message'"
+            [title]="isProcessingAI ? 'Stop AI response' : 'Send message'"
+          >
+            <app-icon [name]="isProcessingAI ? 'stop' : 'execute'" [size]="14"></app-icon>
+          </button>
         </div>
       </div>
     </div>
   </div>
 </div>
 
+<div
+  class="copy-notification"
+  [class.show]="isCopyToastVisible"
+  role="status"
+  aria-live="polite"
+>
+  {{ copyToastMessage }}
+</div>
+
 <div class="connection-modal-backdrop" *ngIf="isConnectionManagerOpen" (click)="closeConnectionManager()">
   <div class="connection-modal manager-modal" (click)="$event.stopPropagation()">
     <div class="connection-modal-header">
       <div>
-        <div class="connections-title">Connection Profiles</div>
-        <div class="connections-subtitle">{{ connectionProfiles.length }} saved</div>
+        <div class="connections-title">Terminal Profiles</div>
+        <div class="connections-subtitle">Built-in, WSL, SSH, and JumpServer launch targets</div>
       </div>
       <div class="connection-modal-actions">
         <button class="settings-button primary" type="button" (click)="startNewConnectionProfile()">
@@ -217,44 +416,69 @@
       </div>
     </div>
 
-    <div class="connections-list" *ngIf="connectionProfiles.length > 0; else emptyConnections">
-      <div
-        class="connection-row"
-        *ngFor="let profile of connectionProfiles; trackBy: trackByConnectionProfileId"
-      >
-        <div class="connection-main">
-          <div class="connection-name-line">
-            <span class="connection-name">{{ profile.name }}</span>
-            <span class="connection-type">{{ getConnectionTypeLabel(profile.type) }}</span>
-          </div>
-          <div class="connection-display-name">
-            {{ generateConnectionDisplayName(profile) }}
-          </div>
-          <div class="connection-meta">
-            <span *ngIf="profile.jumpHost">Jump {{ profile.jumpUser ? profile.jumpUser + '@' : '' }}{{ profile.jumpHost }}{{ profile.jumpPort ? ':' + profile.jumpPort : '' }}</span>
-            <span *ngIf="profile.targetHost">Target {{ profile.targetUser ? profile.targetUser + '@' : '' }}{{ profile.targetHost }}{{ profile.targetPort ? ':' + profile.targetPort : '' }}</span>
-            <span>Last {{ formatConnectionTime(profile.lastConnectedAt) }}</span>
-          </div>
-          <div class="connection-tags" *ngIf="profile.tags.length > 0">
-            <span class="connection-tag" *ngFor="let tag of profile.tags">{{ tag }}</span>
-          </div>
+    <div class="connections-list">
+      <div class="terminal-profile-group" *ngIf="localTerminalProfiles.length > 0">
+        <div class="terminal-profile-group-title">Local Terminals</div>
+        <ng-container *ngTemplateOutlet="terminalProfileRows; context: { items: localTerminalProfiles }"></ng-container>
+      </div>
+
+      <div class="terminal-profile-group" *ngIf="isLoadingTerminalProfiles || wslTerminalProfiles.length > 0">
+        <div class="terminal-profile-group-title">WSL</div>
+        <div class="empty-connections compact-empty" *ngIf="isLoadingTerminalProfiles">
+          Loading WSL distributions...
         </div>
-        <div class="connection-actions">
-          <button class="settings-button" type="button" (click)="connectConnectionProfile(profile)">
-            Connect
+        <ng-container *ngTemplateOutlet="terminalProfileRows; context: { items: wslTerminalProfiles }"></ng-container>
+      </div>
+
+      <div class="terminal-profile-group">
+        <div class="terminal-profile-group-title">Connection Profiles</div>
+        <ng-container *ngIf="connectionTerminalProfiles.length > 0; else emptyConnections">
+          <ng-container *ngTemplateOutlet="terminalProfileRows; context: { items: connectionTerminalProfiles }"></ng-container>
+        </ng-container>
+      </div>
+    </div>
+
+    <ng-template #terminalProfileRows let-items="items">
+      <div
+        class="connection-row compact-profile-row"
+        *ngFor="let item of items; trackBy: trackByTerminalProfileId"
+      >
+        <button
+          class="terminal-profile-open"
+          type="button"
+          [disabled]="item.disabled"
+          [title]="item.disabledReason || item.displayName"
+          (click)="openTerminalProfile(item)"
+        >
+          <span class="connection-name">{{ item.name }}</span>
+          <span class="connection-type">{{ item.status }}</span>
+          <span class="connection-display-name">{{ item.displayName }}</span>
+        </button>
+        <div class="connection-actions compact-actions">
+          <button class="settings-button compact" type="button" (click)="openTerminalProfile(item)" [disabled]="item.disabled">
+            Open
           </button>
-          <button class="settings-button" type="button" (click)="editConnectionProfile(profile)">
+          <button
+            class="settings-button compact"
+            type="button"
+            (click)="probeTerminalProfile(item)"
+            [disabled]="item.source !== 'connection' || isProbingConnectionProfile"
+            [title]="item.source === 'connection' ? 'Probe this connection profile' : 'Local terminal probing will be implemented later'"
+          >
+            Probe
+          </button>
+          <button class="settings-button compact" type="button" *ngIf="item.editable" (click)="editTerminalProfile(item)">
             Edit
           </button>
-          <button class="settings-button" type="button" (click)="duplicateConnectionProfile(profile)">
-            Duplicate
+          <button class="settings-button compact" type="button" *ngIf="item.editable" (click)="duplicateTerminalProfile(item)">
+            Copy
           </button>
-          <button class="settings-button danger" type="button" (click)="deleteConnectionProfile(profile)">
-            Delete
+          <button class="settings-button compact danger" type="button" *ngIf="item.deletable" (click)="deleteTerminalProfile(item)">
+            Del
           </button>
         </div>
       </div>
-    </div>
+    </ng-template>
 
     <ng-template #emptyConnections>
       <div class="empty-connections">
@@ -262,8 +486,8 @@
       </div>
     </ng-template>
 
-    <div class="settings-status" *ngIf="connectionStatus && !isConnectionFormOpen">
-      {{ connectionStatus }}
+    <div class="settings-status" *ngIf="(connectionStatus || terminalProfilesStatus) && !isConnectionFormOpen">
+      {{ connectionStatus || terminalProfilesStatus }}
     </div>
 
     <div class="connection-form-backdrop" *ngIf="isConnectionFormOpen" (click)="closeConnectionForm()">
@@ -366,6 +590,42 @@
 
           <div class="connection-section">
             <div class="connection-section-header">
+              <div>
+                <div class="connection-section-title">Server Context</div>
+                <div class="connection-section-subtitle" *ngIf="connectionForm.probeUpdatedAt">
+                  Last probe: {{ formatConnectionTime(connectionForm.probeUpdatedAt) }}
+                </div>
+              </div>
+              <button
+                class="settings-button primary"
+                type="button"
+                (click)="probeConnectionProfileFromForm()"
+                [disabled]="isProbingConnectionProfile"
+              >
+                {{ isProbingConnectionProfile ? 'Probing...' : 'Probe' }}
+              </button>
+            </div>
+            <textarea
+              id="serverContext"
+              class="settings-textarea server-context-textarea"
+              [(ngModel)]="connectionForm.serverContext"
+              rows="8"
+              placeholder="Probe results and manual notes used by AI command generation..."
+            ></textarea>
+            <div class="server-context-path" *ngIf="connectionForm.serverContextPath">
+              File: {{ connectionForm.serverContextPath }}
+            </div>
+            <details class="probe-raw-output" *ngIf="connectionForm.probeRawOutput">
+              <summary>Raw probe output</summary>
+              <pre>{{ connectionForm.probeRawOutput }}</pre>
+            </details>
+            <div class="settings-status" *ngIf="probeStatus">
+              {{ probeStatus }}
+            </div>
+          </div>
+
+          <div class="connection-section">
+            <div class="connection-section-header">
               <div class="connection-section-title">Auto Input Rules</div>
               <button class="settings-button" type="button" (click)="addAutoInputRule()">Add Rule</button>
             </div>
@@ -392,7 +652,7 @@
           </div>
 
           <div class="settings-actions">
-            <button class="settings-button primary" type="button" (click)="saveConnectionProfile()">
+            <button class="settings-button primary" type="button" (click)="saveConnectionProfile()" [disabled]="isProbingConnectionProfile">
               {{ connectionFormMode === 'edit' ? 'Save Changes' : 'Create Profile' }}
             </button>
             <button class="settings-button" type="button" (click)="closeConnectionForm()">

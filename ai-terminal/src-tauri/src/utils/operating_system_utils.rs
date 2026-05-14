@@ -1,4 +1,9 @@
 use crate::command::types::command_manager::CommandManager;
+use serde::Serialize;
+#[cfg(target_os = "windows")]
+use std::process::{Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::time::{Duration, Instant};
 use tauri::State;
 
 // Add a helper function to get the OS information
@@ -32,4 +37,129 @@ pub fn get_current_pid(
     } else {
         Ok(0)
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WslDistribution {
+    pub name: String,
+    pub state: String,
+    pub version: Option<u8>,
+    pub is_default: bool,
+}
+
+#[tauri::command]
+pub fn list_wsl_distributions() -> Result<Vec<WslDistribution>, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Ok(Vec::new());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = run_wsl_list_with_timeout(Duration::from_secs(4))?;
+
+        if !output.status.success() {
+            let stderr = decode_process_output(&output.stderr);
+            return Err(format!(
+                "wsl.exe --list --verbose failed: {}",
+                stderr.trim()
+            ));
+        }
+
+        Ok(parse_wsl_distributions(&decode_process_output(&output.stdout)))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_wsl_list_with_timeout(timeout: Duration) -> Result<std::process::Output, String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let mut child = Command::new("wsl.exe")
+        .args(["--list", "--verbose"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("Failed to run wsl.exe --list --verbose: {e}"))?;
+
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| format!("Failed to read wsl.exe --list --verbose output: {e}"));
+            }
+            Ok(None) if started_at.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("wsl.exe --list --verbose timed out.".to_string());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("Failed while waiting for wsl.exe --list --verbose: {e}"));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn decode_process_output(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let utf16: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&utf16);
+    }
+
+    if bytes.len() > 2 && bytes[1] == 0 {
+        let utf16: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&utf16);
+    }
+
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn parse_wsl_distributions(output: &str) -> Vec<WslDistribution> {
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            let is_default = trimmed.starts_with('*');
+            let without_marker = trimmed.trim_start_matches('*').trim();
+            let columns: Vec<&str> = without_marker.split_whitespace().collect();
+            if columns.is_empty() {
+                return None;
+            }
+
+            let version = columns.last().and_then(|value| value.parse::<u8>().ok());
+            let state = columns
+                .get(columns.len().saturating_sub(2))
+                .map(|value| (*value).to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let name_end = columns.len().saturating_sub(if version.is_some() { 2 } else { 1 });
+            let name = columns[..name_end.max(1)].join(" ");
+
+            Some(WslDistribution {
+                name,
+                state,
+                version,
+                is_default,
+            })
+        })
+        .collect()
 }

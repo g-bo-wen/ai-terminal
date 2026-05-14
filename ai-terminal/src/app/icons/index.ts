@@ -4,6 +4,8 @@ import { copy } from './copy.icon';
 import { copyToTerminal } from './copy-to-terminal.icon';
 import { connection } from './connection.icon';
 import { execute } from './execute.icon';
+import { stop } from './stop.icon';
+import { aiExplain } from './ai-explain.icon';
 
 export type IconName =
   | 'ai-panel-visible'
@@ -11,7 +13,9 @@ export type IconName =
   | 'connection'
   | 'copy'
   | 'copy-to-terminal'
-  | 'execute';
+  | 'execute'
+  | 'stop'
+  | 'ai-explain';
 
 const ICONS: Record<IconName, string> = {
   'ai-panel-visible': aiPanelVisible,
@@ -20,6 +24,8 @@ const ICONS: Record<IconName, string> = {
   'copy': copy,
   'copy-to-terminal': copyToTerminal,
   'execute': execute,
+  'stop': stop,
+  'ai-explain': aiExplain,
 };
 
 const SVG_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
