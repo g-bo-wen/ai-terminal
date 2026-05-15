@@ -81,7 +81,7 @@ To build NSIS and MSI installers on Windows:
 
 ```powershell
 npm install
-npm run tauri build -- --bundles nsis,msi
+npm run tauri build -- "--bundles=nsis,msi"
 ```
 
 The installers are generated in:

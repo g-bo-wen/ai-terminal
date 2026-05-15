@@ -486,10 +486,6 @@
       </div>
     </ng-template>
 
-    <div class="settings-status" *ngIf="(connectionStatus || terminalProfilesStatus) && !isConnectionFormOpen">
-      {{ connectionStatus || terminalProfilesStatus }}
-    </div>
-
     <div class="connection-form-backdrop" *ngIf="isConnectionFormOpen" (click)="closeConnectionForm()">
       <div class="connection-modal form-modal" (click)="$event.stopPropagation()">
         <div class="connection-modal-header">

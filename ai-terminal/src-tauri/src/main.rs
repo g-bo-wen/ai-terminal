@@ -29,6 +29,7 @@ fn main() {
             command::core::pty::pty_write,
             command::core::pty::pty_resize,
             command::core::pty::pty_close_session,
+            utils::operating_system_utils::is_process_elevated,
             utils::operating_system_utils::get_current_pid,
             utils::operating_system_utils::list_wsl_distributions,
             utils::server_context_utils::save_server_context_file,

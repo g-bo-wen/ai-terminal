@@ -25,6 +25,62 @@ pub fn get_system_environment_variables() -> Result<Vec<(String, String)>, Strin
 }
 
 #[tauri::command]
+pub fn is_process_elevated() -> Result<bool, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(false)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::size_of;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        unsafe {
+            let mut token: HANDLE = null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(format!(
+                    "Failed to open process token: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut returned_size = 0_u32;
+            let success = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut elevation as *mut TOKEN_ELEVATION as *mut _,
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned_size,
+            );
+            let close_result = CloseHandle(token);
+
+            if success == 0 {
+                return Err(format!(
+                    "Failed to read process elevation token: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            if close_result == 0 {
+                return Err(format!(
+                    "Failed to close process token: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            Ok(elevation.TokenIsElevated != 0)
+        }
+    }
+}
+
+#[tauri::command]
 pub fn get_current_pid(
     session_id: String,
     command_manager: State<'_, CommandManager>,
