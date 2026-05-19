@@ -20,114 +20,14 @@ export interface ExtractCodeBlocksResult {
 })
 export class AiResponseFormatService {
   parseCommandFromResponse(response: string): ParsedCommandPart[] {
-    const results: ParsedCommandPart[] = [];
-    let lastIndex = 0;
-    const tripleCommandRegex = /```([^`]+)```/g;
-    let match: RegExpExecArray | null;
-
-    while ((match = tripleCommandRegex.exec(response)) !== null) {
-      const textBefore = response.slice(lastIndex, match.index);
-
-      if (textBefore) {
-        const processedText = this.processSingleBackticks(textBefore);
-        if (processedText) {
-          results.push({ command: '', fullText: processedText });
-        }
-      }
-
-      results.push({
-        command: match[1].trim(),
-        fullText: match[0]
-      });
-
-      lastIndex = match.index + match[0].length;
-
-      const nextChars = response.slice(lastIndex, lastIndex + 4);
-      if (nextChars === '\\n') {
-        results.push({ command: '', fullText: '\n' });
-        lastIndex += 4;
-      }
-    }
-
-    const textAfter = response.slice(lastIndex);
-    if (textAfter) {
-      const processedText = this.processSingleBackticks(textAfter);
-      if (processedText) {
-        results.push({ command: '', fullText: processedText });
-      }
-    }
-
-    return results;
+    return response ? [{ command: '', fullText: this.processSingleBackticks(response) }] : [];
   }
 
   extractCodeBlocks(text: string): ExtractCodeBlocksResult {
-    const codeBlocks: ExtractedCodeBlock[] = [];
-    const commandParts = this.parseCommandFromResponse(text);
-
-    if (commandParts.length > 0) {
-      const formattedParts = commandParts.map((part) => {
-        if (part.command) {
-          codeBlocks.push({
-            code: part.command,
-            language: 'command'
-          });
-          return `<code-block-${codeBlocks.length - 1}></code-block-${codeBlocks.length - 1}>`;
-        }
-        return part.fullText;
-      });
-
-      return {
-        formattedText: formattedParts.join(''),
-        codeBlocks
-      };
-    }
-
-    if (text.trim().startsWith('```') && text.trim().endsWith('```')) {
-      const trimmedText = text.trim();
-      const content = trimmedText.slice(3, -3).trim();
-      if (content) {
-        const lines = content.split('\n');
-        let code: string;
-        let language = 'text';
-
-        if (lines.length > 1 && !lines[0].includes(' ') && lines[0].length < 20) {
-          language = lines[0];
-          code = lines.slice(1).join('\n').trim();
-        } else {
-          code = content;
-        }
-
-        codeBlocks.push({ code, language });
-        return { formattedText: '<code-block-0></code-block-0>', codeBlocks };
-      }
-    }
-
-    if (text.length < 100 && !text.includes('\n') && !text.includes('```')) {
-      codeBlocks.push({
-        code: text.trim(),
-        language: 'command'
-      });
-
-      return { formattedText: '<code-block-0></code-block-0>', codeBlocks };
-    }
-
-    const codeBlockRegex = /```([\w-]*)?(?:\s*\n)?([\s\S]*?)```/gm;
-    const formattedText = text.replace(codeBlockRegex, (language, code) => {
-      if (!code || !code.trim()) {
-        return '';
-      }
-
-      const trimmedCode = code.trim();
-      const index = codeBlocks.length;
-      codeBlocks.push({
-        code: trimmedCode,
-        language: language ? language.trim() : 'text'
-      });
-
-      return `<code-block-${index}></code-block-${index}>`;
-    });
-
-    return { formattedText, codeBlocks };
+    return {
+      formattedText: this.processSingleBackticks(text),
+      codeBlocks: []
+    };
   }
 
   isSimpleCommand(code: string): boolean {

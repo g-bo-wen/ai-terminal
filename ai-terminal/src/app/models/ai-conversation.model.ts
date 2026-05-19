@@ -10,6 +10,7 @@ export interface AiMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  rawContent?: string;
   createdAt: string;
   codeBlocks?: AiCodeBlock[];
   suggestions?: CommandSuggestion[];

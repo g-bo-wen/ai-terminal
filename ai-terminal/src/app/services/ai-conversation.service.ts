@@ -6,6 +6,7 @@ import { CommandSuggestion } from '../models/command-suggestion.model';
 export interface CreateAiMessageInput {
   role: AiMessage['role'];
   content: string;
+  rawContent?: string;
   codeBlocks?: AiCodeBlock[];
   suggestions?: CommandSuggestion[];
   isCommand?: boolean;
@@ -14,6 +15,7 @@ export interface CreateAiMessageInput {
 
 export interface UpdateAiMessagePatch {
   content?: string;
+  rawContent?: string;
   codeBlocks?: AiCodeBlock[];
   suggestions?: CommandSuggestion[];
   isCommand?: boolean;
@@ -108,6 +110,7 @@ export class AiConversationService {
       id: this.createClientId('message'),
       role: input.role,
       content: input.content,
+      rawContent: input.rawContent,
       createdAt: new Date().toISOString(),
       codeBlocks: input.codeBlocks,
       suggestions: input.suggestions,

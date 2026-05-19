@@ -45,6 +45,8 @@ import { TerminalSessionService } from './services/terminal-session.service';
 import { ConnectionCommandService } from './services/connection-command.service';
 import { ConnectionProbeLogicService } from './services/connection-probe-logic.service';
 import { CommandExecutionFormatService } from './services/command-execution-format.service';
+import { CommandTagParserService, ParsedCommandTag } from './services/command-tag-parser.service';
+import { CommandRiskPolicyService } from './services/command-risk-policy.service';
 import {
   buildTerminalAssistantSystemPrompt,
   TerminalAssistantEnvironmentContext
@@ -158,6 +160,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   currentQuestion: string = '';
   isProcessingAI: boolean = false;
   commandExplanationStates: Record<string, CommandExplanationState> = {};
+  readonly executionResultFeatureEnabled = false;
   isAIPanelVisible: boolean = true;
   activeAiView: 'chat' | 'settings' = 'chat';
   aiApiBaseUrl: string = 'https://api.openai.com/v1';
@@ -246,13 +249,31 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     private terminalSessionService: TerminalSessionService,
     private connectionCommandService: ConnectionCommandService,
     private connectionProbeLogicService: ConnectionProbeLogicService,
-    private commandExecutionFormatService: CommandExecutionFormatService
+    private commandExecutionFormatService: CommandExecutionFormatService,
+    private commandTagParserService: CommandTagParserService,
+    private commandRiskPolicyService: CommandRiskPolicyService
   ) { }
 
 
   // Public method to sanitize HTML content
   public sanitizeHtml(html: string): SafeHtml {
     return this.sanitizer.bypassSecurityTrustHtml(html);
+  }
+
+  getMessageDisplaySegments(message: AiMessage): string[] {
+    return this.splitMessageIntoDisplaySegments(this.getDisplayText(message.content));
+  }
+
+  getDisplayText(text: string): string {
+    return text
+      .replace(/\\r\\n/g, '\n')
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, '  ');
+  }
+
+  private splitMessageIntoDisplaySegments(text: string): string[] {
+    const segments = text.split(/(<code-block-\d+><\/code-block-\d+>)/g);
+    return segments.filter(segment => segment.length > 0);
   }
 
   private loadAiSettings(): void {
@@ -912,12 +933,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   // Add a new method to parse commands from AI responses
   parseCommandFromResponse(response: string): { command: string, fullText: string }[] {
-    return this.aiResponseFormatService.parseCommandFromResponse(response);
+    return this.commandTagParserService.parseCommandTags(response).map((commandTag) => ({
+      command: commandTag.command,
+      fullText: commandTag.raw
+    }));
   }
 
   // Extract code blocks from response text
   extractCodeBlocks(text: string): { formattedText: string, codeBlocks: { code: string, language: string }[] } {
-    return this.aiResponseFormatService.extractCodeBlocks(text);
+    const parsed = this.commandTagParserService.formatContentWithCommandTags(text);
+    return {
+      formattedText: parsed.formattedText,
+      codeBlocks: parsed.commands.map((commandTag) => ({
+        code: commandTag.command,
+        language: 'command'
+      }))
+    };
   }
 
   // Handle code copy button click
@@ -1517,6 +1548,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private serializeAiMessageContentForApi(message: AiMessage): string {
+    if (message.rawContent) {
+      return message.rawContent;
+    }
+
     if (
       (!message.codeBlocks || message.codeBlocks.length === 0) &&
       (!message.suggestions || message.suggestions.length === 0)
@@ -1533,10 +1568,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         return '';
       }
 
-      const codeBlockLanguage = codeBlock?.language || 'command';
-      const language = codeBlockLanguage === 'command' ? 'bash' : codeBlockLanguage;
-      return `\`\`\`${language || 'bash'}\n${command}\n\`\`\``;
+      const title = this.escapeCommandTagAttribute(suggestion?.title || '命令');
+      const risk = suggestion?.riskLevel || 'caution';
+      return `<CMD title="${title}" risk="${risk}">${command}</CMD>`;
     });
+  }
+
+  private escapeCommandTagAttribute(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
   }
 
   private detectOperatingSystem(): string {
@@ -1622,14 +1665,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           userMessage.id,
           this.aiAbortController.signal
         );
-
-        // Check if the response contains a command we can execute
-        const commandParts = this.parseCommandFromResponse(response);
-        const hasCommands = commandParts.some(part => part.command);
-        if (hasCommands) {
-          // If this is a direct shell command question, we can enhance the UI by marking it as a command
-          assistantMessage.isCommand = true;
-        }
       }
 
       this.processAssistantMessage(conversation.id, assistantMessage.id, response, assistantMessage.isCommand);
@@ -1769,21 +1804,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     response: string,
     isCommand: boolean = false
   ): void {
-    const { formattedText, codeBlocks } = this.extractCodeBlocks(response);
+    const { formattedText, commands } = this.commandTagParserService.formatContentWithCommandTags(response);
     const createdAt = new Date().toISOString();
-    const suggestions = codeBlocks.map((codeBlock, index) =>
-      this.createCommandSuggestion(conversationId, messageId, codeBlock.code, index, createdAt)
+    const suggestions = commands.map((commandTag, index) =>
+      this.createCommandSuggestion(conversationId, messageId, commandTag, index, createdAt)
     );
-    const sanitizedCodeBlocks = suggestions.map((suggestion, index) => ({
+    const sanitizedCodeBlocks = suggestions.map((suggestion) => ({
       code: suggestion.command,
-      language: codeBlocks[index]?.language || 'command'
+      language: 'command'
     }));
 
     this.aiConversationService.updateMessage(conversationId, messageId, {
       content: formattedText,
+      rawContent: response,
       codeBlocks: sanitizedCodeBlocks,
       suggestions,
-      isCommand
+      isCommand: isCommand || suggestions.length > 0
     });
     this.syncAiConversationState();
   }
@@ -1791,19 +1827,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private createCommandSuggestion(
     conversationId: string,
     messageId: string,
-    rawCommand: string,
+    commandTag: ParsedCommandTag,
     index: number,
     createdAt: string
   ): CommandSuggestion {
-    const explanation = this.aiResponseFormatService.getCommandExplanation(rawCommand) || undefined;
-
     return {
       id: `${messageId}-suggestion-${index}`,
       conversationId,
       messageId,
-      command: this.transformCodeForDisplay(rawCommand),
-      explanation,
-      riskLevel: 'review',
+      title: commandTag.title,
+      command: commandTag.command,
+      riskLevel: commandTag.risk,
+      raw: commandTag.raw,
       createdAt
     };
   }
@@ -3068,7 +3103,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   sendSuggestionToTerminal(suggestion: CommandSuggestion): void {
-    this.sendCodeToTerminal(suggestion.command);
+    if (this.activeSessionId) {
+      this.writeToPtySession(this.activeSessionId, suggestion.command).catch((error) => {
+        console.error('Failed to send command to PTY:', error);
+      });
+    }
+    this.focusTerminalInput();
+
+    this.showCopiedNotification('Copied to terminal');
   }
 
   private createCommandExecutionForSuggestion(
@@ -3137,14 +3179,20 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     code: string,
     options: ExecuteTerminalCommandOptions = {}
   ): Promise<void> {
-    const command = this.transformCodeForDisplay(code);
+    const command = options.suggestion ? code.trim() : this.transformCodeForDisplay(code);
     const activeSessionId = this.activeSessionId;
-    if (activeSessionId && options.suggestion && this.runningExecutionStatesBySession.has(activeSessionId)) {
+    if (
+      this.executionResultFeatureEnabled &&
+      activeSessionId &&
+      options.suggestion &&
+      this.runningExecutionStatesBySession.has(activeSessionId)
+    ) {
       console.warn('A command execution is already running in this terminal session.');
       return;
     }
 
-    const shouldCollectExecution = Boolean(options.suggestion) &&
+    const shouldCollectExecution = this.executionResultFeatureEnabled &&
+      Boolean(options.suggestion) &&
       this.commandExecutionFormatService.shouldCollectCommandExecution(command);
     const execution = shouldCollectExecution
       ? this.createCommandExecutionForSuggestion(command, options.suggestion)
@@ -3190,7 +3238,32 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   executeSuggestionDirectly(suggestion: CommandSuggestion): void {
+    if (!this.confirmCommandExecutionIfNeeded(suggestion)) {
+      return;
+    }
+
     void this.executeCodeDirectly(suggestion.command, { suggestion });
+  }
+
+  getCommandRiskLabel(suggestion: CommandSuggestion): string {
+    return this.commandRiskPolicyService.getRiskLabel(suggestion.riskLevel);
+  }
+
+  getCommandRiskClass(suggestion: CommandSuggestion): string {
+    return `risk-${suggestion.riskLevel}`;
+  }
+
+  private confirmCommandExecutionIfNeeded(suggestion: CommandSuggestion): boolean {
+    if (!this.commandRiskPolicyService.requiresConfirmation(suggestion.riskLevel)) {
+      return true;
+    }
+
+    const riskLabel = this.getCommandRiskLabel(suggestion);
+    return window.confirm([
+      `Execute ${riskLabel.toLowerCase()} command "${suggestion.title}"?`,
+      '',
+      suggestion.command
+    ].join('\n'));
   }
 
   getExecutionsForSuggestion(

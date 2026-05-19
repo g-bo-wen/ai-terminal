@@ -112,9 +112,8 @@
             class="conversation-card"
             *ngFor="let conversation of aiConversations; trackBy: trackByAiConversationId"
             [class.active]="conversation.id === activeAiConversationId"
-            (click)="continueAiConversation(conversation.id)"
           >
-            <div class="conversation-card-header">
+            <div class="conversation-card-header" (click)="continueAiConversation(conversation.id)">
               <div class="conversation-card-main">
                 <div class="conversation-title">{{ conversation.title }}</div>
                 <div class="conversation-meta">
@@ -136,15 +135,23 @@
               [class.chat-entry-user]="message.role === 'user'"
               [class.chat-entry-ai]="message.role === 'assistant'"
               [class.chat-entry-system]="message.role === 'system'"
+              (mousedown)="$event.stopPropagation()"
+              (click)="$event.stopPropagation()"
             >
               <div class="chat-output">
                 <span class="chat-message-label">{{ getAiMessageLabel(message) }}:</span>
                 <ng-container *ngIf="message.role === 'assistant'; else plainMessage">
-                  <ng-container *ngFor="let segment of message.content.split('\n'); trackBy: trackByResponseSegment">
+                  <ng-container *ngFor="let segment of getMessageDisplaySegments(message); trackBy: trackByResponseSegment">
                     <ng-container *ngIf="isCodeBlockPlaceholder(segment)">
                       <ng-container *ngIf="getMessageSuggestion(message, segment) as suggestion">
                         <div class="command-block">
                           <div class="command-content">
+                            <div class="command-card-header">
+                              <span class="command-card-title">{{ suggestion.title }}</span>
+                              <span class="command-risk-badge" [ngClass]="getCommandRiskClass(suggestion)">
+                                {{ getCommandRiskLabel(suggestion) }}
+                              </span>
+                            </div>
                             <span class="simple-command">
                               <span class="command-text">
                                 {{ suggestion.command }}
@@ -213,7 +220,7 @@
                           </ng-container>
                           <div
                             class="execution-attachments"
-                            *ngIf="getExecutionsForSuggestion(conversation, suggestion.id).length > 0"
+                            *ngIf="executionResultFeatureEnabled && getExecutionsForSuggestion(conversation, suggestion.id).length > 0"
                             (click)="$event.stopPropagation()"
                           >
                             <div
@@ -279,12 +286,12 @@
                       </ng-container>
                     </ng-container>
 
-                    <div *ngIf="!isCodeBlockPlaceholder(segment)" [innerHTML]="sanitizeHtml(segment)"></div>
+                    <span class="chat-text-segment" *ngIf="!isCodeBlockPlaceholder(segment)">{{ segment }}</span>
                   </ng-container>
                 </ng-container>
 
                 <ng-template #plainMessage>
-                  <div [innerHTML]="sanitizeHtml(message.content)"></div>
+                  <span class="chat-text-segment">{{ getDisplayText(message.content) }}</span>
                 </ng-template>
               </div>
             </div>
