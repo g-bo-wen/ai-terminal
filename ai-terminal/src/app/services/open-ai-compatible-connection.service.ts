@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core';
 import { ChatHistory } from '../models/chat-history.model';
+import { AiChatLogService } from './ai-chat-log.service';
 
 export interface OpenAiConnectionContext {
   apiBaseUrl: string;
@@ -14,6 +15,8 @@ export interface OpenAiConnectionContext {
   providedIn: 'root'
 })
 export class OpenAiCompatibleConnectionService {
+  constructor(private aiChatLogService: AiChatLogService) { }
+
   normalizeBaseUrl(baseUrl: string): string {
     const trimmed = baseUrl.trim().replace(/\/+$/, '');
     if (!trimmed) {
@@ -25,24 +28,87 @@ export class OpenAiCompatibleConnectionService {
 
   async loadModels(apiBaseUrl: string, apiKey: string): Promise<string[]> {
     const normalizedBaseUrl = this.normalizeBaseUrl(apiBaseUrl);
-    const response = await fetch(`${normalizedBaseUrl}/models`, {
-      method: 'GET',
-      headers: this.buildHeaders(apiKey)
+    const endpoint = `${normalizedBaseUrl}/models`;
+    const headers = this.buildHeaders(apiKey);
+    const requestId = this.aiChatLogService.createRequestId('models');
+
+    await this.aiChatLogService.logEvent({
+      requestId,
+      phase: 'request',
+      operation: 'load-models',
+      timestamp: new Date().toISOString(),
+      endpoint,
+      data: {
+        method: 'GET',
+        headers: this.aiChatLogService.redactHeaders(headers)
+      }
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`OpenAI compatible API error: ${response.status} - ${errorText}`);
-    }
+    try {
+      const response = await fetch(endpoint, {
+        method: 'GET',
+        headers
+      });
 
-    const data = await response.json();
-    if (!Array.isArray(data?.data)) {
-      throw new Error('Unexpected models response format');
-    }
+      const responseText = await response.text();
+      const { parsedResponse, parseError } = this.parseJsonResponseForLog(responseText);
 
-    return data.data
-      .map((model: any) => model?.id)
-      .filter((id: unknown): id is string => typeof id === 'string' && id.trim().length > 0);
+      await this.aiChatLogService.logEvent({
+        requestId,
+        phase: response.ok && !parseError ? 'response' : 'error',
+        operation: 'load-models',
+        timestamp: new Date().toISOString(),
+        endpoint,
+        data: {
+          status: response.status,
+          statusText: response.statusText,
+          rawResponseText: responseText,
+          parsedResponse,
+          parseError: parseError ? this.aiChatLogService.serializeError(parseError) : undefined
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`OpenAI compatible API error: ${response.status} - ${responseText}`);
+      }
+
+      if (parseError) {
+        throw new Error('Unexpected models response format. See AI chat log for raw response.');
+      }
+
+      const data = parsedResponse;
+      if (!Array.isArray(data?.data)) {
+        await this.aiChatLogService.logEvent({
+          requestId,
+          phase: 'error',
+          operation: 'load-models',
+          timestamp: new Date().toISOString(),
+          endpoint,
+          data: {
+            reason: 'Missing data array',
+            rawResponseText: responseText,
+            parsedResponse
+          }
+        });
+        throw new Error('Unexpected models response format');
+      }
+
+      return data.data
+        .map((model: any) => model?.id)
+        .filter((id: unknown): id is string => typeof id === 'string' && id.trim().length > 0);
+    } catch (error) {
+      await this.aiChatLogService.logEvent({
+        requestId,
+        phase: 'error',
+        operation: 'load-models',
+        timestamp: new Date().toISOString(),
+        endpoint,
+        data: {
+          error: this.aiChatLogService.serializeError(error)
+        }
+      });
+      throw error;
+    }
   }
 
   async testOpenAiConnection(context: OpenAiConnectionContext): Promise<void> {
@@ -115,7 +181,7 @@ export class OpenAiCompatibleConnectionService {
     await this.testOpenAiConnection(context);
   }
 
-  private buildHeaders(apiKey: string): HeadersInit {
+  private buildHeaders(apiKey: string): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json'
     };
@@ -125,5 +191,20 @@ export class OpenAiCompatibleConnectionService {
     }
 
     return headers;
+  }
+
+  private parseJsonResponseForLog(responseText: string): { parsedResponse: any; parseError?: Error } {
+    if (!responseText.trim()) {
+      return { parsedResponse: null };
+    }
+
+    try {
+      return { parsedResponse: JSON.parse(responseText) };
+    } catch (error) {
+      return {
+        parsedResponse: null,
+        parseError: error instanceof Error ? error : new Error(String(error))
+      };
+    }
   }
 }

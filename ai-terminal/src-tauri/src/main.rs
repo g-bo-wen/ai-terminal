@@ -33,6 +33,8 @@ fn main() {
             utils::operating_system_utils::get_current_pid,
             utils::operating_system_utils::list_wsl_distributions,
             utils::server_context_utils::save_server_context_file,
+            utils::ai_log_utils::write_ai_log_event,
+            utils::ai_log_utils::get_ai_log_file_path,
             command::autocomplete::autocomplete_command::autocomplete,
             utils::file_system_utils::get_working_directory,
             utils::file_system_utils::get_home_directory,

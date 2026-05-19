@@ -36,6 +36,7 @@ import {
 import { TerminalTabComponent } from './components/terminal-tab/terminal-tab.component';
 import { IconComponent } from './components/icon/icon.component';
 import { AiCommandService } from './services/ai-command.service';
+import { AiChatLogService } from './services/ai-chat-log.service';
 import { AiConversationService } from './services/ai-conversation.service';
 import { AiResponseFormatService } from './services/ai-response-format.service';
 import { ConnectionProfileService } from './services/connection-profile.service';
@@ -164,6 +165,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   currentLLMModel: string = '';
   availableModels: string[] = [];
   aiSettingsStatus: string = '';
+  aiLogFilePath: string = '';
   isLoadingModels: boolean = false;
   copyToastMessage: string = '';
   isCopyToastVisible: boolean = false;
@@ -236,6 +238,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   constructor(
     private sanitizer: DomSanitizer,
     private aiCommandService: AiCommandService,
+    private aiChatLogService: AiChatLogService,
     private aiConversationService: AiConversationService,
     private aiResponseFormatService: AiResponseFormatService,
     private connectionProfileService: ConnectionProfileService,
@@ -326,6 +329,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   async ngOnInit() {
     this.loadAiSettings();
+    void this.loadAiLogFilePath();
     this.loadConnectionProfiles();
     void this.refreshProcessElevationStatus();
 
@@ -341,6 +345,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     // Clean any existing code blocks to ensure no backticks are displayed
     this.sanitizeAllCodeBlocks();
     this.syncAiConversationState();
+  }
+
+  private async loadAiLogFilePath(): Promise<void> {
+    try {
+      this.aiLogFilePath = await this.aiChatLogService.getLogFilePath();
+    } catch (error) {
+      console.error('Failed to resolve AI chat log file path:', error);
+    }
   }
 
   ngAfterViewInit(): void {
@@ -1014,12 +1026,39 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     currentUserMessageId: string,
     signal?: AbortSignal
   ): Promise<string> {
+    const requestId = this.aiChatLogService.createRequestId('chat');
+    let apiEndpoint = '';
     try {
       if (!this.aiApiKey.trim()) {
+        await this.aiChatLogService.logEvent({
+          requestId,
+          phase: 'error',
+          operation: 'chat-completion',
+          timestamp: new Date().toISOString(),
+          model,
+          conversationId,
+          messageId: currentUserMessageId,
+          data: {
+            input: question,
+            error: 'OpenAI compatible API key is not configured.'
+          }
+        });
         return 'Error: OpenAI compatible API key is not configured. Open Settings and add a key.';
       }
 
       if (!model.trim()) {
+        await this.aiChatLogService.logEvent({
+          requestId,
+          phase: 'error',
+          operation: 'chat-completion',
+          timestamp: new Date().toISOString(),
+          conversationId,
+          messageId: currentUserMessageId,
+          data: {
+            input: question,
+            error: 'No model is selected.'
+          }
+        });
         return 'Error: No model is selected. Open Settings, enter a model, or load models from your endpoint.';
       }
 
@@ -1058,36 +1097,119 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       };
 
       const normalizedBaseUrl = this.openAiConnectionService.normalizeBaseUrl(this.aiApiBaseUrl);
-      const apiEndpoint = `${normalizedBaseUrl}/chat/completions`;
+      apiEndpoint = `${normalizedBaseUrl}/chat/completions`;
+      const requestHeaders = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.aiApiKey.trim()}`
+      };
+
+      await this.aiChatLogService.logEvent({
+        requestId,
+        phase: 'request',
+        operation: 'chat-completion',
+        timestamp: new Date().toISOString(),
+        endpoint: apiEndpoint,
+        model,
+        conversationId,
+        messageId: currentUserMessageId,
+        data: {
+          method: 'POST',
+          headers: this.aiChatLogService.redactHeaders(requestHeaders),
+          body: requestBody
+        }
+      });
 
       const response = await fetch(apiEndpoint, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.aiApiKey.trim()}`
-        },
+        headers: requestHeaders,
         body: JSON.stringify(requestBody),
         signal
       });
 
+      const responseText = await response.text();
+      const { parsedResponse, parseError } = this.parseJsonResponseForLog(responseText);
+
+      await this.aiChatLogService.logEvent({
+        requestId,
+        phase: response.ok && !parseError ? 'response' : 'error',
+        operation: 'chat-completion',
+        timestamp: new Date().toISOString(),
+        endpoint: apiEndpoint,
+        model,
+        conversationId,
+        messageId: currentUserMessageId,
+        data: {
+          status: response.status,
+          statusText: response.statusText,
+          rawResponseText: responseText,
+          parsedResponse,
+          parseError: parseError ? this.aiChatLogService.serializeError(parseError) : undefined
+        }
+      });
+
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI compatible API error: ${response.status} - ${errorText}`);
+        throw new Error(`OpenAI compatible API error: ${response.status} - ${responseText}`);
       }
 
-      const data = await response.json();
+      if (parseError) {
+        return 'Error: Unexpected response format from OpenAI compatible API. See AI chat log for raw response.';
+      }
 
+      const data = parsedResponse;
       const content = data.choices?.[0]?.message?.content;
       if (!content) {
         console.error('Unexpected response format:', data);
-        return 'Error: Unexpected response format from OpenAI compatible API';
+        await this.aiChatLogService.logEvent({
+          requestId,
+          phase: 'error',
+          operation: 'chat-completion',
+          timestamp: new Date().toISOString(),
+          endpoint: apiEndpoint,
+          model,
+          conversationId,
+          messageId: currentUserMessageId,
+          data: {
+            reason: 'Missing choices[0].message.content',
+            rawResponseText: responseText,
+            parsedResponse
+          }
+        });
+        return 'Error: Unexpected response format from OpenAI compatible API. See AI chat log for raw response.';
       }
 
       return content;
     } catch (error: any) {
       if (this.isAbortError(error)) {
+        await this.aiChatLogService.logEvent({
+          requestId,
+          phase: 'error',
+          operation: 'chat-completion',
+          timestamp: new Date().toISOString(),
+          endpoint: apiEndpoint || undefined,
+          model,
+          conversationId,
+          messageId: currentUserMessageId,
+          data: {
+            aborted: true,
+            error: this.aiChatLogService.serializeError(error)
+          }
+        });
         throw error;
       }
+
+      await this.aiChatLogService.logEvent({
+        requestId,
+        phase: 'error',
+        operation: 'chat-completion',
+        timestamp: new Date().toISOString(),
+        endpoint: apiEndpoint || undefined,
+        model,
+        conversationId,
+        messageId: currentUserMessageId,
+        data: {
+          error: this.aiChatLogService.serializeError(error)
+        }
+      });
 
       // Add more specific error messages for different failure types
       if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
@@ -1095,6 +1217,21 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       }
 
       return `Error: ${error.message || 'Unknown error calling OpenAI compatible API'}`;
+    }
+  }
+
+  private parseJsonResponseForLog(responseText: string): { parsedResponse: any; parseError?: Error } {
+    if (!responseText.trim()) {
+      return { parsedResponse: null };
+    }
+
+    try {
+      return { parsedResponse: JSON.parse(responseText) };
+    } catch (error) {
+      return {
+        parsedResponse: null,
+        parseError: error instanceof Error ? error : new Error(String(error))
+      };
     }
   }
 
@@ -1206,6 +1343,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     suggestion: CommandSuggestion,
     signal: AbortSignal
   ): Promise<string> {
+    const requestId = this.aiChatLogService.createRequestId('command-explanation');
     const state = this.commandExplanationStates[suggestion.id] || this.createEmptyCommandExplanationState(suggestion.id);
     const systemPrompt = [
       'You explain terminal commands for production troubleshooting.',
@@ -1245,32 +1383,113 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     const normalizedBaseUrl = this.openAiConnectionService.normalizeBaseUrl(this.aiApiBaseUrl);
-    const response = await fetch(`${normalizedBaseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.aiApiKey.trim()}`
-      },
-      body: JSON.stringify({
-        model: this.currentLLMModel,
-        messages,
-        stream: false
-      }),
-      signal
+    const apiEndpoint = `${normalizedBaseUrl}/chat/completions`;
+    const requestHeaders = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${this.aiApiKey.trim()}`
+    };
+    const requestBody = {
+      model: this.currentLLMModel,
+      messages,
+      stream: false
+    };
+
+    await this.aiChatLogService.logEvent({
+      requestId,
+      phase: 'request',
+      operation: 'command-explanation',
+      timestamp: new Date().toISOString(),
+      endpoint: apiEndpoint,
+      model: this.currentLLMModel,
+      conversationId: suggestion.conversationId,
+      messageId: suggestion.messageId,
+      data: {
+        suggestionId: suggestion.id,
+        method: 'POST',
+        headers: this.aiChatLogService.redactHeaders(requestHeaders),
+        body: requestBody
+      }
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`OpenAI compatible API error: ${response.status} - ${errorText}`);
-    }
+    try {
+      const response = await fetch(apiEndpoint, {
+        method: 'POST',
+        headers: requestHeaders,
+        body: JSON.stringify(requestBody),
+        signal
+      });
 
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error('Unexpected response format from OpenAI compatible API');
-    }
+      const responseText = await response.text();
+      const { parsedResponse, parseError } = this.parseJsonResponseForLog(responseText);
 
-    return content;
+      await this.aiChatLogService.logEvent({
+        requestId,
+        phase: response.ok && !parseError ? 'response' : 'error',
+        operation: 'command-explanation',
+        timestamp: new Date().toISOString(),
+        endpoint: apiEndpoint,
+        model: this.currentLLMModel,
+        conversationId: suggestion.conversationId,
+        messageId: suggestion.messageId,
+        data: {
+          suggestionId: suggestion.id,
+          status: response.status,
+          statusText: response.statusText,
+          rawResponseText: responseText,
+          parsedResponse,
+          parseError: parseError ? this.aiChatLogService.serializeError(parseError) : undefined
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`OpenAI compatible API error: ${response.status} - ${responseText}`);
+      }
+
+      if (parseError) {
+        throw new Error('Unexpected response format from OpenAI compatible API. See AI chat log for raw response.');
+      }
+
+      const data = parsedResponse;
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) {
+        await this.aiChatLogService.logEvent({
+          requestId,
+          phase: 'error',
+          operation: 'command-explanation',
+          timestamp: new Date().toISOString(),
+          endpoint: apiEndpoint,
+          model: this.currentLLMModel,
+          conversationId: suggestion.conversationId,
+          messageId: suggestion.messageId,
+          data: {
+            suggestionId: suggestion.id,
+            reason: 'Missing choices[0].message.content',
+            rawResponseText: responseText,
+            parsedResponse
+          }
+        });
+        throw new Error('Unexpected response format from OpenAI compatible API. See AI chat log for raw response.');
+      }
+
+      return content;
+    } catch (error) {
+      await this.aiChatLogService.logEvent({
+        requestId,
+        phase: 'error',
+        operation: 'command-explanation',
+        timestamp: new Date().toISOString(),
+        endpoint: apiEndpoint,
+        model: this.currentLLMModel,
+        conversationId: suggestion.conversationId,
+        messageId: suggestion.messageId,
+        data: {
+          suggestionId: suggestion.id,
+          aborted: this.isAbortError(error),
+          error: this.aiChatLogService.serializeError(error)
+        }
+      });
+      throw error;
+    }
   }
 
   private createEmptyCommandExplanationState(suggestionId: string): CommandExplanationState {
@@ -1506,6 +1725,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       clearChatHistory: () => {
         this.aiConversationService.clearActiveConversationMessages();
         this.syncAiConversationState();
+      },
+      getAiLogFilePath: async () => {
+        this.aiLogFilePath = await this.aiChatLogService.getLogFilePath();
+        return this.aiLogFilePath;
       },
       testOpenAiConnection: () => {
         void this.testOpenAiConnection();

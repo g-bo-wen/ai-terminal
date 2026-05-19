@@ -341,6 +341,11 @@
           />
         </div>
 
+        <div class="settings-section" *ngIf="aiLogFilePath">
+          <label class="settings-label">AI Chat Log</label>
+          <div class="settings-status">{{ aiLogFilePath }}</div>
+        </div>
+
         <div class="settings-section" *ngIf="availableModels.length > 0">
           <label class="settings-label" for="modelList">Loaded Models</label>
           <select

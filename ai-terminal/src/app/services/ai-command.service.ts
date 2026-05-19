@@ -11,6 +11,7 @@ export interface AiCommandContext {
   loadModels: () => Promise<string[]>;
   saveSettings: () => void;
   clearChatHistory: () => void;
+  getAiLogFilePath: () => Promise<string>;
   testOpenAiConnection: () => void;
   retryOpenAiConnection: () => Promise<void>;
 }
@@ -32,6 +33,7 @@ Available commands:
 /model [name] - Show current model or switch to a different model
 /host [url] - Show current API host or set a new one
 /retry - Retry connection to the OpenAI compatible API
+/logs - Show AI chat log file path
 /clear - Clear the AI chat history`;
 
       case '/models':
@@ -82,6 +84,13 @@ Available commands:
           void context.retryOpenAiConnection();
         }, 100);
         return 'Attempting to reconnect to the OpenAI compatible API...';
+
+      case '/logs':
+        try {
+          return `AI chat log file: ${await context.getAiLogFilePath()}`;
+        } catch (error) {
+          return `Error: Failed to get AI chat log file path: ${error}`;
+        }
 
       case '/clear':
         context.clearChatHistory();
