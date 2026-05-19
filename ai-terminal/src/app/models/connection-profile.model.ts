@@ -24,6 +24,7 @@ export interface ConnectionProfile {
   targetPassword?: string;
   authMethod: ConnectionAuthMethod;
   privateKeyPath?: string;
+  privateKeyPassphrase?: string;
   autoInputRules: AutoInputRule[];
   tags: string[];
   description?: string;

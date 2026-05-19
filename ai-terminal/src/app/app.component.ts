@@ -72,6 +72,7 @@ interface ConnectionProfileForm {
   targetPassword: string;
   authMethod: ConnectionAuthMethod;
   privateKeyPath: string;
+  privateKeyPassphrase: string;
   autoInputRules: AutoInputRule[];
   tagsText: string;
   description: string;
@@ -2494,35 +2495,35 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const startedAt = Date.now();
     let lastLength = (this.ptyBufferBySession.get(sessionId) || '').length;
     let lastChangedAt = startedAt;
-    let loggedPasswordPrompt = false;
-    let loggedPasswordAttempt = false;
+    let loggedAuthPrompt = false;
+    let loggedAuthPromptAttempt = false;
 
     while (Date.now() - startedAt < timeoutMs) {
       await this.sleep(200);
       const output = this.connectionProbeLogicService.normalizeTerminalOutput(this.ptyBufferBySession.get(sessionId) || '');
       const runtime = this.activeConnectionRuntimes.get(sessionId);
-      const passwordAutomationPending = runtime?.profileSnapshot?.authMethod === 'password' && !runtime.passwordAttempted;
+      const authPromptAutomationPending = runtime ? this.hasPendingAuthPromptAutomation(runtime) : false;
       const hasPrompt = this.connectionProbeLogicService.hasLikelyShellPrompt(output);
       if (!hasPrompt && this.connectionProbeLogicService.hasProbeConnectionFailure(output)) {
         throw new Error(`Connection failed before probe could run.\n${output.slice(-1200)}`);
       }
 
-      if (passwordAutomationPending && !hasPrompt && this.connectionProbeLogicService.hasPasswordPrompt(this.getPtyOutputTail(sessionId))) {
-        if (!loggedPasswordPrompt) {
-          logProbeDebug?.(`password prompt detected, outputLength=${output.length}`);
-          loggedPasswordPrompt = true;
+      if (authPromptAutomationPending && !hasPrompt && this.connectionProbeLogicService.hasPasswordPrompt(this.getPtyOutputTail(sessionId))) {
+        if (!loggedAuthPrompt) {
+          logProbeDebug?.(`auth prompt detected, outputLength=${output.length}`);
+          loggedAuthPrompt = true;
         }
         lastChangedAt = Date.now();
         continue;
       }
 
-      if (passwordAutomationPending && !hasPrompt) {
+      if (authPromptAutomationPending && !hasPrompt) {
         lastChangedAt = Date.now();
         continue;
       }
-      if (runtime?.passwordAttempted && !loggedPasswordAttempt) {
-        logProbeDebug?.(`password automation attempted, outputLength=${output.length}`);
-        loggedPasswordAttempt = true;
+      if (runtime?.passwordAttempted && !loggedAuthPromptAttempt) {
+        logProbeDebug?.(`auth prompt automation attempted, outputLength=${output.length}`);
+        loggedAuthPromptAttempt = true;
       }
 
       const currentLength = output.length;
@@ -2550,8 +2551,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const startedAt = Date.now();
     let lastLength = (this.ptyBufferBySession.get(sessionId) || '').length;
     let lastChangedAt = startedAt;
-    let loggedPasswordPrompt = false;
-    let loggedPasswordAttempt = false;
+    let loggedAuthPrompt = false;
+    let loggedAuthPromptAttempt = false;
 
     while (Date.now() - startedAt < timeoutMs) {
       await this.sleep(200);
@@ -2561,23 +2562,23 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       }
 
       const runtime = this.activeConnectionRuntimes.get(sessionId);
-      const passwordAutomationPending = runtime?.profileSnapshot?.authMethod === 'password' && !runtime.passwordAttempted;
-      if (passwordAutomationPending && this.connectionProbeLogicService.hasPasswordPrompt(this.getPtyOutputTail(sessionId))) {
-        if (!loggedPasswordPrompt) {
-          logProbeDebug?.(`password prompt detected for direct probe, outputLength=${output.length}`);
-          loggedPasswordPrompt = true;
+      const authPromptAutomationPending = runtime ? this.hasPendingAuthPromptAutomation(runtime) : false;
+      if (authPromptAutomationPending && this.connectionProbeLogicService.hasPasswordPrompt(this.getPtyOutputTail(sessionId))) {
+        if (!loggedAuthPrompt) {
+          logProbeDebug?.(`auth prompt detected for direct probe, outputLength=${output.length}`);
+          loggedAuthPrompt = true;
         }
         lastChangedAt = Date.now();
         continue;
       }
 
-      if (passwordAutomationPending) {
+      if (authPromptAutomationPending) {
         lastChangedAt = Date.now();
         continue;
       }
-      if (runtime?.passwordAttempted && !loggedPasswordAttempt) {
-        logProbeDebug?.(`password automation attempted for direct probe, outputLength=${output.length}`);
-        loggedPasswordAttempt = true;
+      if (runtime?.passwordAttempted && !loggedAuthPromptAttempt) {
+        logProbeDebug?.(`auth prompt automation attempted for direct probe, outputLength=${output.length}`);
+        loggedAuthPromptAttempt = true;
       }
 
       const currentLength = output.length;
@@ -2730,22 +2731,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    await this.handlePasswordPromptAutomation(runtime);
+    await this.handleAuthPromptAutomation(runtime);
     await this.handleJumpServerAutoInputRules(runtime);
   }
 
-  private async handlePasswordPromptAutomation(runtime: ActiveConnectionRuntime): Promise<void> {
+  private async handleAuthPromptAutomation(runtime: ActiveConnectionRuntime): Promise<void> {
     if (runtime.passwordAttempted) {
       return;
     }
 
     const profile = this.getConnectionRuntimeProfile(runtime);
-    if (!profile || profile.authMethod !== 'password') {
+    if (!profile) {
       return;
     }
 
-    const password = this.getConnectionPassword(profile);
-    if (!password) {
+    const promptSecret = this.getConnectionAuthPromptSecret(profile);
+    if (!promptSecret) {
       return;
     }
 
@@ -2758,19 +2759,36 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     try {
       await invoke<void>('pty_write', {
         sessionId: runtime.terminalSessionId,
-        data: this.withTerminalSubmitSequence(password)
+        data: this.withTerminalSubmitSequence(promptSecret)
       });
     } catch (error) {
-      console.error(`Failed to submit SSH password for session ${runtime.terminalSessionId}:`, error);
+      console.error(`Failed to submit SSH auth prompt secret for session ${runtime.terminalSessionId}:`, error);
     }
   }
 
-  private getConnectionPassword(profile: ConnectionProfile): string | undefined {
-    if (profile.type === 'jumpserver') {
-      return profile.jumpPassword;
+  private hasPendingAuthPromptAutomation(runtime: ActiveConnectionRuntime): boolean {
+    if (runtime.passwordAttempted) {
+      return false;
     }
 
-    return profile.targetPassword;
+    const profile = this.getConnectionRuntimeProfile(runtime);
+    return !!profile && !!this.getConnectionAuthPromptSecret(profile);
+  }
+
+  private getConnectionAuthPromptSecret(profile: ConnectionProfile): string | undefined {
+    if (profile.authMethod === 'privateKey') {
+      return profile.privateKeyPassphrase;
+    }
+
+    if (profile.authMethod === 'password') {
+      if (profile.type === 'jumpserver') {
+        return profile.jumpPassword;
+      }
+
+      return profile.targetPassword;
+    }
+
+    return undefined;
   }
 
   private getPtyOutputTail(sessionId: string): string {
@@ -2989,6 +3007,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       targetPassword: '',
       authMethod: 'password',
       privateKeyPath: '',
+      privateKeyPassphrase: '',
       autoInputRules: [],
       tagsText: '',
       description: '',
@@ -3013,6 +3032,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       targetPassword: profile.targetPassword || '',
       authMethod: profile.authMethod,
       privateKeyPath: profile.privateKeyPath || '',
+      privateKeyPassphrase: profile.privateKeyPassphrase || '',
       autoInputRules: profile.autoInputRules.map((rule) => ({ ...rule })),
       tagsText: profile.tags.join(', '),
       description: profile.description || '',
@@ -3037,6 +3057,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       targetPassword: this.rawEmptyToUndefined(this.connectionForm.targetPassword),
       authMethod: this.connectionForm.authMethod,
       privateKeyPath: this.emptyToUndefined(this.connectionForm.privateKeyPath),
+      privateKeyPassphrase: this.rawEmptyToUndefined(this.connectionForm.privateKeyPassphrase),
       autoInputRules: this.connectionForm.autoInputRules.map((rule) => ({ ...rule })),
       tags: this.connectionForm.tagsText
         .split(',')
@@ -3086,7 +3107,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private getTerminalSubmitSequence(): string {
-    return this.detectOperatingSystem() === 'Windows' ? '\r' : '\n';
+    return '\r';
   }
 
   // Method to copy code to terminal input (adds to prompt for editing, does not execute)

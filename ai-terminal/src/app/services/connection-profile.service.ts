@@ -212,6 +212,7 @@ export class ConnectionProfileService {
       targetPassword: this.normalizeOptionalRawString(value['targetPassword']),
       authMethod,
       privateKeyPath: this.normalizeOptionalString(value['privateKeyPath']),
+      privateKeyPassphrase: this.normalizeOptionalRawString(value['privateKeyPassphrase']),
       autoInputRules: this.normalizeAutoInputRules(value['autoInputRules']),
       tags: this.normalizeTags(value['tags']),
       description: this.normalizeOptionalString(value['description']),

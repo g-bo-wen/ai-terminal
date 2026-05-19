@@ -585,6 +585,10 @@
                 <label class="settings-label" for="targetUser">User</label>
                 <input id="targetUser" class="settings-input" type="text" [(ngModel)]="connectionForm.targetUser" placeholder="root" />
               </div>
+              <div class="settings-section" *ngIf="connectionForm.authMethod === 'privateKey'">
+                <label class="settings-label" for="privateKeyPassphrase">Private Key Passphrase</label>
+                <input id="privateKeyPassphrase" class="settings-input password-input" type="password" [(ngModel)]="connectionForm.privateKeyPassphrase" autocomplete="new-password" />
+              </div>
               <div class="settings-section" *ngIf="connectionForm.authMethod === 'password'">
                 <label class="settings-label" for="targetPassword">Password</label>
                 <input id="targetPassword" class="settings-input password-input" type="password" [(ngModel)]="connectionForm.targetPassword" />
