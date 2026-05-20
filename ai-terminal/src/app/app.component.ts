@@ -104,6 +104,16 @@ interface CurrentConnectionContext {
   jumpUser?: string;
 }
 
+interface HiddenConnectionInputEcho {
+  remaining: string;
+  missedChunks: number;
+}
+
+interface ConnectionDisplayFilterResult {
+  data: string;
+  replaceBuffer: boolean;
+}
+
 interface CommandExplanationTurn {
   role: 'user' | 'assistant';
   content: string;
@@ -206,10 +216,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   @ViewChild('tabsScrollArea') tabsScrollAreaRef?: ElementRef<HTMLDivElement>;
   private terminal: Terminal | null = null;
   private fitAddon: FitAddon | null = null;
+  private ptyListenersRegistered = false;
   private ptySessions = new Set<string>();
   private pendingPtySessions = new Set<string>();
   private ptySessionPromises = new Map<string, Promise<void>>();
   private ptyBufferBySession = new Map<string, string>();
+  private ptyRawBufferBySession = new Map<string, string>();
+  private ptyDisplayEpochBySession = new Map<string, number>();
+  private hiddenConnectionInputEchoesBySession = new Map<string, HiddenConnectionInputEcho[]>();
+  private authPromptReplayFilteredSessions = new Set<string>();
+  private autoInputReplayValuesBySession = new Map<string, string[]>();
+  private postAutoInputNormalizeBudgetBySession = new Map<string, number>();
   private pendingPtyInputBySession = new Map<string, string>();
   private ptyInputFlushPromises = new Map<string, Promise<void>>();
   private runningExecutionStatesBySession = new Map<string, RunningExecutionState>();
@@ -383,7 +400,27 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private initializeInteractiveTerminal(): void {
-    if (!this.terminalContainerRef?.nativeElement || this.terminal) {
+    if (!this.terminalContainerRef?.nativeElement) {
+      return;
+    }
+
+    if (!this.terminal) {
+      this.createInteractiveTerminalInstance();
+    }
+
+    if (!this.ptyListenersRegistered) {
+      this.ptyListenersRegistered = true;
+      void this.registerPtyListeners();
+    }
+
+    if (this.activeSessionId) {
+      void this.ensurePtySession(this.activeSessionId);
+    }
+  }
+
+  private createInteractiveTerminalInstance(): void {
+    const terminalContainer = this.terminalContainerRef?.nativeElement;
+    if (!terminalContainer) {
       return;
     }
 
@@ -405,7 +442,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       }
     });
     this.terminal.loadAddon(this.fitAddon);
-    this.terminal.open(this.terminalContainerRef.nativeElement);
+    this.terminal.open(terminalContainer);
     this.fitAddon.fit();
     this.registerTerminalClipboardShortcuts();
     this.focusTerminalInput();
@@ -428,11 +465,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           console.error('Failed to resize PTY:', error);
         });
     });
-
-    void this.registerPtyListeners();
-    if (this.activeSessionId) {
-      void this.ensurePtySession(this.activeSessionId);
-    }
   }
 
   private registerTerminalClipboardShortcuts(): void {
@@ -600,19 +632,76 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private async registerPtyListeners(): Promise<void> {
-    const unlistenPtyOutput = await listen('pty_output', (event) => {
+    const unlistenPtyOutput = await listen('pty_output', async (event) => {
       const payload = event.payload as { sessionId: string; data: string };
-      const displayData = this.filterRunningExecutionDisplayOutput(payload.sessionId, payload.data);
 
       this.respondToTerminalStatusQueries(payload.sessionId, payload.data);
       this.captureRunningExecutionOutput(payload.sessionId, payload.data);
 
-      const previous = this.ptyBufferBySession.get(payload.sessionId) || '';
-      this.ptyBufferBySession.set(payload.sessionId, previous + displayData);
+      const previousRaw = this.ptyRawBufferBySession.get(payload.sessionId) || '';
+      this.ptyRawBufferBySession.set(payload.sessionId, previousRaw + payload.data);
+      this.logConnectionDisplayDebug('pty_output raw chunk', {
+        sessionId: payload.sessionId,
+        ...this.describeTerminalDataForDebug(payload.data)
+      });
 
-      void this.handleConnectionAutomation(payload.sessionId);
+      const displayEpoch = this.ptyDisplayEpochBySession.get(payload.sessionId) || 0;
+      const suppressDisplayData = await this.handleConnectionAutomation(payload.sessionId);
+      this.logConnectionDisplayDebug('pty_output processed automation', {
+        sessionId: payload.sessionId,
+        chunkLength: payload.data.length,
+        suppressDisplayData,
+        displayEpoch,
+        currentEpoch: this.ptyDisplayEpochBySession.get(payload.sessionId) || 0
+      });
+      if (suppressDisplayData) {
+        return;
+      }
+      if ((this.ptyDisplayEpochBySession.get(payload.sessionId) || 0) !== displayEpoch) {
+        this.logConnectionDisplayDebug('discarded stale display chunk after truncation', {
+          sessionId: payload.sessionId,
+          displayEpoch,
+          currentEpoch: this.ptyDisplayEpochBySession.get(payload.sessionId) || 0,
+          chunkLength: payload.data.length
+        });
+        return;
+      }
+
+      const connectionDisplay = this.filterConnectionDisplayOutput(payload.sessionId, payload.data);
+      const displayData = this.filterRunningExecutionDisplayOutput(payload.sessionId, connectionDisplay.data);
+      this.logConnectionDisplayDebug('connection display filter result', {
+        sessionId: payload.sessionId,
+        replaceBuffer: connectionDisplay.replaceBuffer,
+        raw: this.describeTerminalDataForDebug(payload.data),
+        connectionFiltered: this.describeTerminalDataForDebug(connectionDisplay.data),
+        displayFiltered: this.describeTerminalDataForDebug(displayData)
+      });
+      const existingDisplayBuffer = this.ptyBufferBySession.get(payload.sessionId) || '';
+      const previous = connectionDisplay.replaceBuffer ? '' : existingDisplayBuffer;
+      const nextDisplayBuffer = previous + displayData;
+      const visibleDisplayUnchanged = connectionDisplay.replaceBuffer &&
+        this.areTerminalDisplayBuffersVisiblyEqual(existingDisplayBuffer, nextDisplayBuffer);
+      const finalDisplayBuffer = visibleDisplayUnchanged ? existingDisplayBuffer : nextDisplayBuffer;
+      this.ptyBufferBySession.set(payload.sessionId, finalDisplayBuffer);
+      this.logConnectionDisplayDebug(
+        connectionDisplay.replaceBuffer ? 'replaced display buffer from replay chunk' : 'appended display chunk',
+        {
+          sessionId: payload.sessionId,
+          displayChunkLength: displayData.length,
+          displayBufferLength: finalDisplayBuffer.length,
+          replaceBuffer: connectionDisplay.replaceBuffer,
+          visibleDisplayUnchanged
+        }
+      );
+
+      if (visibleDisplayUnchanged) {
+        return;
+      }
 
       if (payload.sessionId === this.activeSessionId && this.terminal && displayData) {
+        if (connectionDisplay.replaceBuffer) {
+          this.recreateInteractiveTerminalForReplay();
+        }
         this.terminal.write(displayData);
       }
     });
@@ -625,6 +714,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.pendingPtyInputBySession.delete(payload.sessionId);
       this.ptyInputFlushPromises.delete(payload.sessionId);
       this.activeConnectionRuntimes.delete(payload.sessionId);
+      this.ptyRawBufferBySession.delete(payload.sessionId);
+      this.ptyDisplayEpochBySession.delete(payload.sessionId);
+      this.hiddenConnectionInputEchoesBySession.delete(payload.sessionId);
+      this.authPromptReplayFilteredSessions.delete(payload.sessionId);
+      this.autoInputReplayValuesBySession.delete(payload.sessionId);
+      this.postAutoInputNormalizeBudgetBySession.delete(payload.sessionId);
       this.failRunningExecutionForSession(payload.sessionId);
     });
 
@@ -661,6 +756,297 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     return filteredData;
+  }
+
+  private filterConnectionDisplayOutput(sessionId: string, data: string): ConnectionDisplayFilterResult {
+    let filteredData = data;
+    let replaceBuffer = false;
+
+    const authReplay = this.filterAuthPromptReplayDisplayOutput(sessionId, filteredData);
+    filteredData = authReplay.data;
+    replaceBuffer = replaceBuffer || authReplay.replaceBuffer;
+
+    const autoInputReplay = this.filterAutoInputReplayDisplayOutput(sessionId, filteredData);
+    filteredData = autoInputReplay.data;
+    replaceBuffer = replaceBuffer || autoInputReplay.replaceBuffer;
+
+    filteredData = this.filterConnectionInputEchoDisplayOutput(sessionId, filteredData);
+    filteredData = this.normalizePostAutoInputDisplayOutputForSession(sessionId, filteredData);
+    return {
+      data: filteredData,
+      replaceBuffer
+    };
+  }
+
+  private filterAuthPromptReplayDisplayOutput(sessionId: string, data: string): ConnectionDisplayFilterResult {
+    if (!this.authPromptReplayFilteredSessions.has(sessionId) || !data) {
+      return { data, replaceBuffer: false };
+    }
+
+    const authPromptEnd = this.findLastSshAuthPromptEnd(data);
+    if (authPromptEnd < 0) {
+      return { data, replaceBuffer: false };
+    }
+
+    const existingDisplayBuffer = this.ptyBufferBySession.get(sessionId) || '';
+    if (existingDisplayBuffer.length > 0) {
+      this.logConnectionDisplayDebug('discarded ssh auth replay output', {
+        sessionId,
+        originalLength: data.length,
+        displayBufferLength: existingDisplayBuffer.length
+      });
+      return {
+        data: '',
+        replaceBuffer: false
+      };
+    }
+
+    const filteredData = this.stripLeadingReplayControls(data.slice(authPromptEnd));
+    this.logConnectionDisplayDebug('filtered ssh auth replay output', {
+      sessionId,
+      originalLength: data.length,
+      filteredLength: filteredData.length
+    });
+    return {
+      data: filteredData,
+      replaceBuffer: true
+    };
+  }
+
+  private filterAutoInputReplayDisplayOutput(sessionId: string, data: string): ConnectionDisplayFilterResult {
+    const replayValues = this.autoInputReplayValuesBySession.get(sessionId) || [];
+    if (!replayValues.length || !data) {
+      return { data, replaceBuffer: false };
+    }
+
+    let filteredData = data;
+    let replaceBuffer = false;
+    for (const replayValue of replayValues) {
+      const trimIndex = this.findJumpServerAutoInputReplayTrimIndex(filteredData, replayValue);
+      if (trimIndex < 0) {
+        continue;
+      }
+
+      const existingDisplayBuffer = this.ptyBufferBySession.get(sessionId) || '';
+      if (existingDisplayBuffer.length > 0) {
+        this.logConnectionDisplayDebug('discarded jumpserver auto input replay output', {
+          sessionId,
+          originalLength: data.length,
+          displayBufferLength: existingDisplayBuffer.length
+        });
+        return {
+          data: '',
+          replaceBuffer: false
+        };
+      }
+
+      filteredData = this.stripLeadingReplayControls(filteredData.slice(trimIndex));
+      replaceBuffer = true;
+    }
+
+    if (replaceBuffer) {
+      this.logConnectionDisplayDebug('filtered jumpserver auto input replay output', {
+        sessionId,
+        originalLength: data.length,
+        filteredLength: filteredData.length
+      });
+    }
+    return {
+      data: filteredData,
+      replaceBuffer
+    };
+  }
+
+  private findLastSshAuthPromptEnd(data: string): number {
+    const patterns = [
+      /Enter passphrase for key[^\r\n]*[:：]/ig,
+      /[^\r\n]*'s password[:：]/ig
+    ];
+    let promptEnd = -1;
+
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(data)) !== null) {
+        promptEnd = Math.max(promptEnd, match.index + match[0].length);
+      }
+    }
+
+    if (promptEnd < 0) {
+      return -1;
+    }
+
+    return promptEnd;
+  }
+
+  private findJumpServerAutoInputReplayTrimIndex(data: string, input: string): number {
+    if (!input) {
+      return -1;
+    }
+
+    const inputIndex = data.lastIndexOf(input);
+    if (inputIndex < 0) {
+      return -1;
+    }
+
+    const prefix = data.slice(0, inputIndex);
+    const suffix = data.slice(inputIndex + input.length);
+    if (
+      !/(?:JumpServer|group_id|group\s*:|host_num|选择组|主机IP)/i.test(prefix) ||
+      !/(?:Connecting|Welcome|Last login)/i.test(suffix)
+    ) {
+      return -1;
+    }
+
+    return inputIndex + input.length;
+  }
+
+  private stripLeadingReplayControls(value: string): string {
+    let index = 0;
+    let prefix = '';
+
+    while (index < value.length) {
+      const rest = value.slice(index);
+      const controlMatch = rest.match(/^(?:\x1B\[[0-?]*[ -/]*[@-~]|\x1B\][^\x07]*(?:\x07|\x1B\\)|\x1B[()][A-Za-z0-9]|\x1B.|[\u0000-\u0008\u000B\u000C\u000E-\u001A\u001C-\u001F]+)/);
+      if (controlMatch) {
+        index += controlMatch[0].length;
+        continue;
+      }
+
+      if (rest.startsWith('\r\n')) {
+        prefix += '\r\n';
+        index += 2;
+        continue;
+      }
+
+      if (rest[0] === '\r' || rest[0] === '\n') {
+        prefix += rest[0];
+        index += 1;
+        continue;
+      }
+
+      break;
+    }
+
+    return prefix + value.slice(index);
+  }
+
+  private areTerminalDisplayBuffersVisiblyEqual(left: string, right: string): boolean {
+    return this.toComparableTerminalText(left) === this.toComparableTerminalText(right);
+  }
+
+  private toComparableTerminalText(value: string): string {
+    return value
+      .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+      .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+      .replace(/\x1B[()][A-Za-z0-9]/g, '')
+      .replace(/\x1B./g, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .replace(/[ \t]+$/gm, '');
+  }
+
+  private filterConnectionInputEchoDisplayOutput(sessionId: string, data: string): string {
+    const hiddenEchoes = this.hiddenConnectionInputEchoesBySession.get(sessionId);
+    if (!hiddenEchoes?.length || !data) {
+      return data;
+    }
+
+    this.logConnectionDisplayDebug('filtering hidden connection input echo', {
+      sessionId,
+      hiddenEchoCount: hiddenEchoes.length,
+      data: this.describeTerminalDataForDebug(data)
+    });
+    let filteredData = data;
+    while (hiddenEchoes.length > 0 && filteredData.length > 0) {
+      const hiddenEcho = hiddenEchoes[0];
+      const expectedEcho = hiddenEcho.remaining;
+      if (!expectedEcho) {
+        hiddenEchoes.shift();
+        continue;
+      }
+
+      const echoIndex = filteredData.indexOf(expectedEcho);
+      if (echoIndex >= 0) {
+        const beforeNormalize = filteredData.slice(echoIndex + expectedEcho.length);
+        hiddenEchoes.shift();
+        filteredData = this.normalizePostAutoInputDisplayOutput(
+          this.stripLeadingReplayControls(beforeNormalize)
+        );
+        this.logConnectionDisplayDebug('matched hidden connection input echo', {
+          sessionId,
+          echoIndex,
+          inputLength: expectedEcho.length,
+          beforeNormalize: this.describeTerminalDataForDebug(beforeNormalize),
+          afterNormalize: this.describeTerminalDataForDebug(filteredData)
+        });
+        continue;
+      }
+
+      if (expectedEcho.startsWith(filteredData)) {
+        hiddenEcho.remaining = expectedEcho.slice(filteredData.length);
+        hiddenEcho.missedChunks = 0;
+        filteredData = '';
+        this.logConnectionDisplayDebug('hidden connection input echo spans chunks', {
+          sessionId,
+          remainingLength: hiddenEcho.remaining.length
+        });
+        break;
+      }
+
+      this.logConnectionDisplayDebug('hidden connection input echo not found in chunk', {
+        sessionId,
+        expectedEchoLength: expectedEcho.length,
+        data: this.describeTerminalDataForDebug(filteredData)
+      });
+      hiddenEchoes.shift();
+      break;
+    }
+
+    if (hiddenEchoes.length === 0) {
+      this.hiddenConnectionInputEchoesBySession.delete(sessionId);
+    }
+    return filteredData;
+  }
+
+  private normalizePostAutoInputDisplayOutput(data: string): string {
+    const normalized = data
+      .replace(/\x1B\[\?25[hl]/g, '')
+      .replace(/\x1B\[(\d+);1H/g, '\r\n')
+      .replace(/\x1B\[\d+;\d+H/g, '')
+      .replace(/\x1B\[\d+G/g, '')
+      .replace(/(?:(?:\r\n|\r|\n)[ \t]*){3,}/g, '\r\n\r\n')
+      .replace(/^(?:\r\n|\r|\n)+$/g, '');
+    if (normalized !== data) {
+      this.logConnectionDisplayDebug('normalized post auto input blank lines', {
+        before: this.describeTerminalDataForDebug(data),
+        after: this.describeTerminalDataForDebug(normalized)
+      });
+    }
+    return normalized;
+  }
+
+  private normalizePostAutoInputDisplayOutputForSession(sessionId: string, data: string): string {
+    const budget = this.postAutoInputNormalizeBudgetBySession.get(sessionId) || 0;
+    if (budget <= 0 || !data) {
+      return data;
+    }
+
+    const normalized = this.normalizePostAutoInputDisplayOutput(data);
+    const nextBudget = this.hasLikelyShellPrompt(normalized) ? 0 : budget - 1;
+    if (nextBudget <= 0) {
+      this.postAutoInputNormalizeBudgetBySession.delete(sessionId);
+    } else {
+      this.postAutoInputNormalizeBudgetBySession.set(sessionId, nextBudget);
+    }
+
+    return normalized;
+  }
+
+  private hasLikelyShellPrompt(data: string): boolean {
+    return /(?:^|\r?\n).+[@][^:\r\n]+:.*[$#]\s*$/.test(
+      this.connectionProbeLogicService.normalizeTerminalOutput(data)
+    );
   }
 
   private captureRunningExecutionOutput(sessionId: string, data: string): void {
@@ -749,6 +1135,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       if (!this.ptyBufferBySession.has(sessionId)) {
         this.ptyBufferBySession.set(sessionId, '');
       }
+      if (!this.ptyRawBufferBySession.has(sessionId)) {
+        this.ptyRawBufferBySession.set(sessionId, '');
+      }
+      if (!this.ptyDisplayEpochBySession.has(sessionId)) {
+        this.ptyDisplayEpochBySession.set(sessionId, 0);
+      }
     })();
 
     this.ptySessionPromises.set(sessionId, createSession);
@@ -762,14 +1154,24 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private renderActivePtyBuffer(): void {
-    if (!this.terminal || !this.activeSessionId) {
+    if (!this.activeSessionId) {
       return;
     }
 
     const sessionId = this.activeSessionId;
     const sessionBuffer = this.ptyBufferBySession.get(sessionId) || '';
     this.isRenderingPtyBuffer = true;
-    this.terminal.reset();
+    this.logConnectionDisplayDebug('rendering active display buffer', {
+      sessionId,
+      displayBufferLength: sessionBuffer.length,
+      rawBufferLength: (this.ptyRawBufferBySession.get(sessionId) || '').length,
+      displayEpoch: this.ptyDisplayEpochBySession.get(sessionId) || 0
+    });
+    this.recreateInteractiveTerminalForReplay();
+    if (!this.terminal) {
+      this.isRenderingPtyBuffer = false;
+      return;
+    }
     if (sessionBuffer.length > 0) {
       this.terminal.write(sessionBuffer, () => {
         this.isRenderingPtyBuffer = false;
@@ -810,6 +1212,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.ptySessionPromises.clear();
     this.pendingPtyInputBySession.clear();
     this.ptyInputFlushPromises.clear();
+    this.ptyRawBufferBySession.clear();
+    this.ptyDisplayEpochBySession.clear();
+    this.hiddenConnectionInputEchoesBySession.clear();
+    this.authPromptReplayFilteredSessions.clear();
+    this.autoInputReplayValuesBySession.clear();
+    this.postAutoInputNormalizeBudgetBySession.clear();
     this.runningExecutionStatesBySession.clear();
     this.activeConnectionRuntimes.clear();
     if (this.copyToastTimeoutId !== undefined) {
@@ -2380,6 +2788,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.probeStatus = 'Connecting and waiting for a stable prompt...';
       this.connectionStatus = this.probeStatus;
       this.ptyBufferBySession.set(probeSessionId, '');
+      this.ptyRawBufferBySession.set(probeSessionId, '');
       this.registerActiveConnectionRuntime(probeSessionId, profile);
 
       await invoke<void>('pty_create_session', {
@@ -2394,7 +2803,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         sessionId: probeSessionId,
         data: this.withTerminalSubmitSequence(sshCommand)
       });
-      logProbeDebug(`sent ssh command, bufferLength=${(this.ptyBufferBySession.get(probeSessionId) || '').length}`);
+      logProbeDebug(`sent ssh command, bufferLength=${(this.ptyRawBufferBySession.get(probeSessionId) || '').length}`);
 
       const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const startMarker = `__AI_TERMINAL_PROBE_START_${nonce}__`;
@@ -2404,11 +2813,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       if (useDirectSshProbe) {
         await this.waitForProbeRemoteCommandReady(probeSessionId, logProbeDebug);
-        outputStartLength = (this.ptyBufferBySession.get(probeSessionId) || '').length;
+        outputStartLength = (this.ptyRawBufferBySession.get(probeSessionId) || '').length;
         logProbeDebug(`direct ssh probe ready, outputStartLength=${outputStartLength}, scriptLineCount=${probeScriptLines.length}`);
       } else {
         await this.waitForProbeConnectionReady(probeSessionId, logProbeDebug);
-        outputStartLength = (this.ptyBufferBySession.get(probeSessionId) || '').length;
+        outputStartLength = (this.ptyRawBufferBySession.get(probeSessionId) || '').length;
         logProbeDebug(`interactive probe ready, outputStartLength=${outputStartLength}, scriptLineCount=${probeScriptLines.length}`);
       }
 
@@ -2449,7 +2858,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.probeStatus = `Probe completed at ${this.formatConnectionTime(startedAt)}.`;
       this.connectionStatus = this.probeStatus;
     } catch (error: any) {
-      const rawOutput = probeSessionId ? this.ptyBufferBySession.get(probeSessionId) || '' : '';
+      const rawOutput = probeSessionId ? this.ptyRawBufferBySession.get(probeSessionId) || '' : '';
       const cleanOutput = this.connectionProbeLogicService.normalizeTerminalOutput(rawOutput);
       const message = this.connectionProbeLogicService.formatProbeFailureMessage(error, cleanOutput);
       this.probeStatus = `Probe failed: ${message}`;
@@ -2465,6 +2874,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.pendingPtySessions.delete(probeSessionId);
         this.ptySessionPromises.delete(probeSessionId);
         this.ptyBufferBySession.delete(probeSessionId);
+        this.ptyRawBufferBySession.delete(probeSessionId);
+        this.ptyDisplayEpochBySession.delete(probeSessionId);
+        this.authPromptReplayFilteredSessions.delete(probeSessionId);
+        this.autoInputReplayValuesBySession.delete(probeSessionId);
+        this.postAutoInputNormalizeBudgetBySession.delete(probeSessionId);
         void invoke<void>('pty_close_session', { sessionId: probeSessionId }).catch(() => undefined);
       }
     }
@@ -2493,14 +2907,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     quietMs: number = 3500
   ): Promise<void> {
     const startedAt = Date.now();
-    let lastLength = (this.ptyBufferBySession.get(sessionId) || '').length;
+    let lastLength = (this.ptyRawBufferBySession.get(sessionId) || '').length;
     let lastChangedAt = startedAt;
     let loggedAuthPrompt = false;
     let loggedAuthPromptAttempt = false;
 
     while (Date.now() - startedAt < timeoutMs) {
       await this.sleep(200);
-      const output = this.connectionProbeLogicService.normalizeTerminalOutput(this.ptyBufferBySession.get(sessionId) || '');
+      const output = this.connectionProbeLogicService.normalizeTerminalOutput(this.ptyRawBufferBySession.get(sessionId) || '');
       const runtime = this.activeConnectionRuntimes.get(sessionId);
       const authPromptAutomationPending = runtime ? this.hasPendingAuthPromptAutomation(runtime) : false;
       const hasPrompt = this.connectionProbeLogicService.hasLikelyShellPrompt(output);
@@ -2549,14 +2963,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     quietMs: number = 1000
   ): Promise<void> {
     const startedAt = Date.now();
-    let lastLength = (this.ptyBufferBySession.get(sessionId) || '').length;
+    let lastLength = (this.ptyRawBufferBySession.get(sessionId) || '').length;
     let lastChangedAt = startedAt;
     let loggedAuthPrompt = false;
     let loggedAuthPromptAttempt = false;
 
     while (Date.now() - startedAt < timeoutMs) {
       await this.sleep(200);
-      const output = this.connectionProbeLogicService.normalizeTerminalOutput(this.ptyBufferBySession.get(sessionId) || '');
+      const output = this.connectionProbeLogicService.normalizeTerminalOutput(this.ptyRawBufferBySession.get(sessionId) || '');
       if (this.connectionProbeLogicService.hasProbeConnectionFailure(output)) {
         throw new Error(`Connection failed before probe could run.\n${output.slice(-1200)}`);
       }
@@ -2611,7 +3025,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     while (Date.now() - startedAt < timeoutMs) {
       await this.sleep(200);
       const output = this.connectionProbeLogicService.normalizeTerminalOutput(
-        (this.ptyBufferBySession.get(sessionId) || '').slice(outputStartLength)
+        (this.ptyRawBufferBySession.get(sessionId) || '').slice(outputStartLength)
       );
       if (output.length !== lastLength) {
         logProbeDebug?.(`probe output changed ${lastLength}->${output.length}, hasStart=${output.includes(startMarker)}, hasEnd=${output.includes(endMarker)}`);
@@ -2640,14 +3054,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     scriptLines: string[],
     logProbeDebug?: ProbeDebugLogger
   ): Promise<void> {
-    const beforeLength = (this.ptyBufferBySession.get(sessionId) || '').length;
+    const beforeLength = (this.ptyRawBufferBySession.get(sessionId) || '').length;
     const payload = [...scriptLines, 'exit 0']
       .map((line) => this.withRemoteTerminalSubmitSequence(line))
       .join('');
     logProbeDebug?.(`writing direct probe script, lineCount=${scriptLines.length}, length=${payload.length}, beforeBuffer=${beforeLength}`);
     await invoke<void>('pty_write', { sessionId, data: payload });
     await this.sleep(300);
-    const afterLength = (this.ptyBufferBySession.get(sessionId) || '').length;
+    const afterLength = (this.ptyRawBufferBySession.get(sessionId) || '').length;
     logProbeDebug?.(`wrote direct probe script, afterBuffer=${afterLength}`);
   }
 
@@ -2656,7 +3070,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     scriptLines: string[],
     logProbeDebug?: ProbeDebugLogger
   ): Promise<void> {
-    const beforeLength = (this.ptyBufferBySession.get(sessionId) || '').length;
+    const beforeLength = (this.ptyRawBufferBySession.get(sessionId) || '').length;
     const payload = [
       'stty -echo 2>/dev/null || true',
       "sh <<'__AI_TERMINAL_PROBE_SCRIPT__'",
@@ -2667,7 +3081,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     logProbeDebug?.(`writing probe script, lineCount=${scriptLines.length}, length=${payload.length}, beforeBuffer=${beforeLength}`);
     await invoke<void>('pty_write', { sessionId, data: payload });
     await this.sleep(300);
-    const afterLength = (this.ptyBufferBySession.get(sessionId) || '').length;
+    const afterLength = (this.ptyRawBufferBySession.get(sessionId) || '').length;
     logProbeDebug?.(`wrote probe script, afterBuffer=${afterLength}`);
   }
 
@@ -2725,37 +3139,44 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     });
   }
 
-  private async handleConnectionAutomation(sessionId: string): Promise<void> {
+  private async handleConnectionAutomation(sessionId: string): Promise<boolean> {
     const runtime = this.activeConnectionRuntimes.get(sessionId);
     if (!runtime) {
-      return;
+      return false;
     }
 
-    await this.handleAuthPromptAutomation(runtime);
-    await this.handleJumpServerAutoInputRules(runtime);
+    const submittedAuthPrompt = await this.handleAuthPromptAutomation(runtime);
+    if (submittedAuthPrompt) {
+      return true;
+    }
+
+    const submittedAutoInput = await this.handleJumpServerAutoInputRules(runtime);
+    return submittedAutoInput;
   }
 
-  private async handleAuthPromptAutomation(runtime: ActiveConnectionRuntime): Promise<void> {
+  private async handleAuthPromptAutomation(runtime: ActiveConnectionRuntime): Promise<boolean> {
     if (runtime.passwordAttempted) {
-      return;
+      return false;
     }
 
     const profile = this.getConnectionRuntimeProfile(runtime);
     if (!profile) {
-      return;
+      return false;
     }
 
     const promptSecret = this.getConnectionAuthPromptSecret(profile);
     if (!promptSecret) {
-      return;
+      return false;
     }
 
     const outputTail = this.getPtyOutputTail(runtime.terminalSessionId);
     if (!this.connectionProbeLogicService.hasPasswordPrompt(outputTail)) {
-      return;
+      return false;
     }
 
     runtime.passwordAttempted = true;
+    this.authPromptReplayFilteredSessions.add(runtime.terminalSessionId);
+    this.clearConnectionDisplayBeforeAutoInput(runtime.terminalSessionId);
     try {
       await invoke<void>('pty_write', {
         sessionId: runtime.terminalSessionId,
@@ -2764,6 +3185,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     } catch (error) {
       console.error(`Failed to submit SSH auth prompt secret for session ${runtime.terminalSessionId}:`, error);
     }
+    return true;
   }
 
   private hasPendingAuthPromptAutomation(runtime: ActiveConnectionRuntime): boolean {
@@ -2792,7 +3214,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private getPtyOutputTail(sessionId: string): string {
-    const output = this.ptyBufferBySession.get(sessionId) || '';
+    const output = this.ptyRawBufferBySession.get(sessionId) || '';
     return output.slice(-4000);
   }
 
@@ -2800,18 +3222,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     return this.connectionCommandService.buildSshCommand(profile, this.detectOperatingSystem());
   }
 
-  private async handleJumpServerAutoInputRules(runtime: ActiveConnectionRuntime): Promise<void> {
+  private async handleJumpServerAutoInputRules(runtime: ActiveConnectionRuntime): Promise<boolean> {
     if (runtime.profileType !== 'jumpserver') {
-      return;
+      return false;
     }
 
     const profile = this.getConnectionRuntimeProfile(runtime);
     if (!profile) {
-      return;
+      return false;
     }
 
     const outputTail = this.getPtyOutputTail(runtime.terminalSessionId);
     const enabledRules = profile.autoInputRules.filter((rule) => rule.enabled);
+    let submittedAutoInput = false;
     for (const rule of enabledRules) {
       if (runtime.firedAutoInputRuleIds.includes(rule.id) || runtime.pendingAutoInputRuleIds.includes(rule.id)) {
         continue;
@@ -2826,13 +3249,26 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         continue;
       }
 
+      this.logConnectionDisplayDebug('jumpserver auto input rule matched', {
+        sessionId: runtime.terminalSessionId,
+        ruleId: rule.id,
+        patternLength: rule.whenOutputMatches.length,
+        inputLength: input.length,
+        appendEnter: rule.appendEnter,
+        outputTail: this.describeTerminalDataForDebug(outputTail)
+      });
       runtime.pendingAutoInputRuleIds.push(rule.id);
+      this.clearConnectionDisplayBeforeAutoInput(runtime.terminalSessionId);
+      this.queueConnectionInputEchoSuppression(runtime.terminalSessionId, input);
+      this.rememberAutoInputReplayValue(runtime.terminalSessionId, input);
+      this.postAutoInputNormalizeBudgetBySession.set(runtime.terminalSessionId, 12);
       try {
         await invoke<void>('pty_write', {
           sessionId: runtime.terminalSessionId,
           data: rule.appendEnter ? this.withTerminalSubmitSequence(input) : input
         });
         runtime.firedAutoInputRuleIds.push(rule.id);
+        submittedAutoInput = true;
       } catch (error) {
         console.error(`Failed to submit JumpServer auto input for session ${runtime.terminalSessionId}:`, error);
       } finally {
@@ -2841,6 +3277,126 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         );
       }
     }
+    return submittedAutoInput;
+  }
+
+  private clearConnectionDisplayBeforeAutoInput(sessionId: string): void {
+    this.ptyBufferBySession.set(sessionId, '');
+    this.ptyDisplayEpochBySession.set(
+      sessionId,
+      (this.ptyDisplayEpochBySession.get(sessionId) || 0) + 1
+    );
+    this.logConnectionDisplayDebug('truncated connection display before auto input', {
+      sessionId,
+      rawBufferLength: (this.ptyRawBufferBySession.get(sessionId) || '').length,
+      displayEpoch: this.ptyDisplayEpochBySession.get(sessionId) || 0
+    });
+    if (sessionId === this.activeSessionId && this.terminal) {
+      this.clearTerminalDisplayAndScrollback();
+    }
+  }
+
+  private clearTerminalDisplayAndScrollback(): void {
+    if (!this.terminal) {
+      return;
+    }
+
+    this.terminal.reset();
+    this.terminal.clear();
+  }
+
+  private recreateInteractiveTerminalForReplay(): void {
+    const terminalContainer = this.terminalContainerRef?.nativeElement;
+    if (!terminalContainer) {
+      return;
+    }
+
+    this.terminal?.dispose();
+    this.terminal = null;
+    this.fitAddon = null;
+    terminalContainer.replaceChildren();
+    this.createInteractiveTerminalInstance();
+  }
+
+  private queueConnectionInputEchoSuppression(sessionId: string, input: string): void {
+    if (!input) {
+      return;
+    }
+
+    const hiddenEchoes = this.hiddenConnectionInputEchoesBySession.get(sessionId) || [];
+    hiddenEchoes.push({
+      remaining: input,
+      missedChunks: 0
+    });
+    this.hiddenConnectionInputEchoesBySession.set(sessionId, hiddenEchoes);
+    this.logConnectionDisplayDebug('queued connection input echo suppression', {
+      sessionId,
+      inputLength: input.length,
+      hiddenEchoCount: hiddenEchoes.length
+    });
+  }
+
+  private rememberAutoInputReplayValue(sessionId: string, input: string): void {
+    if (!input) {
+      return;
+    }
+
+    const replayValues = this.autoInputReplayValuesBySession.get(sessionId) || [];
+    if (!replayValues.includes(input)) {
+      replayValues.push(input);
+      this.autoInputReplayValuesBySession.set(sessionId, replayValues);
+    }
+  }
+
+  private logConnectionDisplayDebug(message: string, details?: Record<string, unknown>): void {
+    if (globalThis.localStorage?.getItem('ai-terminal.debug.connection-display') !== '1') {
+      return;
+    }
+
+    console.debug(`[CONNECTION-DISPLAY] ${message}`, details || {});
+  }
+
+  private describeTerminalDataForDebug(data: string): Record<string, unknown> {
+    const normalizedLines = data.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+    let longestBlankRun = 0;
+    let currentBlankRun = 0;
+    for (const line of normalizedLines) {
+      if (line.trim().length === 0) {
+        currentBlankRun += 1;
+        longestBlankRun = Math.max(longestBlankRun, currentBlankRun);
+      } else {
+        currentBlankRun = 0;
+      }
+    }
+
+    return {
+      length: data.length,
+      crlfCount: (data.match(/\r\n/g) || []).length,
+      crOnlyCount: (data.match(/\r(?!\n)/g) || []).length,
+      lfOnlyCount: (data.match(/(?<!\r)\n/g) || []).length,
+      longestBlankRun,
+      containsEscK: data.includes('\x1b[K'),
+      containsConnecting: /\*{3}\.\.\.Connecting\.\.\.\*{3}/i.test(data),
+      containsWelcome: /Welcome to /i.test(data),
+      containsDocumentation: /Documentation:/i.test(data),
+      containsLastLogin: /Last login:/i.test(data),
+      containsJumpServer: /JumpServer/i.test(data),
+      containsHostPrompt: /(?:主机IP|选择组)/i.test(data),
+      preview: this.escapeTerminalDataForDebug(data, 900),
+      tailPreview: this.escapeTerminalDataForDebug(data.slice(-500), 500)
+    };
+  }
+
+  private escapeTerminalDataForDebug(data: string, maxLength: number): string {
+    const truncated = data.length > maxLength ? `${data.slice(0, maxLength)}...<truncated>` : data;
+    return truncated
+      .replace(/\x1b/g, '<ESC>')
+      .replace(/\r/g, '<CR>')
+      .replace(/\n/g, '<LF>')
+      .replace(/\t/g, '<TAB>')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, (char) =>
+        `<0x${char.charCodeAt(0).toString(16).padStart(2, '0')}>`
+      );
   }
 
   private getAutoInputValue(rule: AutoInputRule, profile: ConnectionProfile): string {
@@ -3497,6 +4053,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.ptySessionPromises.delete(sessionId);
       this.activeConnectionRuntimes.delete(sessionId);
       this.ptyBufferBySession.delete(sessionId);
+      this.ptyRawBufferBySession.delete(sessionId);
+      this.ptyDisplayEpochBySession.delete(sessionId);
+      this.hiddenConnectionInputEchoesBySession.delete(sessionId);
+      this.authPromptReplayFilteredSessions.delete(sessionId);
+      this.autoInputReplayValuesBySession.delete(sessionId);
+      this.postAutoInputNormalizeBudgetBySession.delete(sessionId);
       this.failRunningExecutionForSession(sessionId);
     }
 
