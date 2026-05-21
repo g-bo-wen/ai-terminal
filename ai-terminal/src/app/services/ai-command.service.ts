@@ -33,7 +33,7 @@ Available commands:
 /model [name] - Show current model or switch to a different model
 /host [url] - Show current API host or set a new one
 /retry - Retry connection to the OpenAI compatible API
-/logs - Show AI chat log file path
+/logs - Show AI chat log directory
 /clear - Clear the AI chat history`;
 
       case '/models':
@@ -87,9 +87,9 @@ Available commands:
 
       case '/logs':
         try {
-          return `AI chat log file: ${await context.getAiLogFilePath()}`;
+          return `AI chat log directory: ${await context.getAiLogFilePath()}`;
         } catch (error) {
-          return `Error: Failed to get AI chat log file path: ${error}`;
+          return `Error: Failed to get AI chat log directory: ${error}`;
         }
 
       case '/clear':

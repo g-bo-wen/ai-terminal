@@ -170,6 +170,14 @@
   background: rgba(115, 201, 145, 0.16);
 }
 
+.new-conversation-button:disabled,
+.new-conversation-button:disabled:hover {
+  border-color: var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: default;
+}
+
 .conversation-mode-label {
   min-width: 0;
   color: var(--text-secondary);
@@ -241,6 +249,13 @@
   min-width: 0;
 }
 
+.conversation-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
 .conversation-select-button {
   display: inline-flex;
   align-items: center;
@@ -255,6 +270,30 @@
   font-family: inherit;
   font-size: 11px;
   cursor: pointer;
+}
+
+.conversation-delete-button,
+.chat-delete-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid rgba(247, 118, 142, 0.3);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--danger);
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.conversation-delete-button:hover,
+.chat-delete-button:hover {
+  border-color: rgba(247, 118, 142, 0.52);
+  background: rgba(247, 118, 142, 0.08);
+  color: var(--text-primary);
 }
 
 .conversation-card.active .conversation-select-button,
@@ -471,6 +510,7 @@
 }
 
 .terminal-output-area {
+  position: relative;
   overflow: hidden;
   padding: 6px;
 }
@@ -479,6 +519,32 @@
   width: 100%;
   height: 100%;
   background: var(--bg-0);
+}
+
+.terminal-session-notice {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  z-index: 5;
+  padding: 8px 10px;
+  border: 1px solid rgba(122, 162, 247, 0.28);
+  border-radius: 6px;
+  background: rgba(15, 17, 21, 0.92);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.35;
+  pointer-events: none;
+}
+
+.terminal-session-notice-warning {
+  border-color: rgba(224, 175, 104, 0.34);
+  color: #e0af68;
+}
+
+.terminal-session-notice-error {
+  border-color: rgba(247, 118, 142, 0.34);
+  color: var(--danger);
 }
 
 .xterm-wrapper .xterm {
@@ -1232,6 +1298,25 @@ select.settings-input {
   border-color: rgba(122, 162, 247, 0.35);
 }
 
+.chat-entry-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.chat-delete-button {
+  min-height: 22px;
+  opacity: 0;
+  transition: opacity 0.15s ease, border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+
+.chat-entry:hover .chat-delete-button,
+.chat-delete-button:focus-visible {
+  opacity: 1;
+}
+
 .chat-entry-user {
   border-color: rgba(122, 162, 247, 0.22);
   background: rgba(122, 162, 247, 0.09);
@@ -1248,11 +1333,14 @@ select.settings-input {
 }
 
 .chat-message-label {
-  display: inline;
-  margin-right: 8px;
+  display: inline-flex;
+  min-width: 0;
+  overflow: hidden;
   color: var(--text-primary);
   font-weight: 700;
   line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-output {
@@ -1726,6 +1814,19 @@ select.settings-input {
 }
 
 @media (max-width: 768px) {
+  .conversation-card-header {
+    align-items: flex-start;
+  }
+
+  .conversation-card-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .chat-delete-button {
+    opacity: 1;
+  }
+
   .command-content {
     flex-direction: column;
     align-items: flex-start;

@@ -1,6 +1,6 @@
 use crate::command::types::pty_manager::{PtyManager, PtySession};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 #[cfg(not(target_os = "windows"))]
 use std::path::Path;
@@ -22,6 +22,14 @@ pub struct PtyExitEvent {
     pub success: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyLaunchCommand {
+    pub executable: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[command]
 pub fn pty_create_session(
     session_id: String,
@@ -29,6 +37,7 @@ pub fn pty_create_session(
     rows: u16,
     launch_kind: Option<String>,
     wsl_distro_name: Option<String>,
+    launch_command: Option<PtyLaunchCommand>,
     app_handle: AppHandle,
     pty_manager: State<'_, PtyManager>,
 ) -> Result<(), String> {
@@ -42,7 +51,11 @@ pub fn pty_create_session(
         })
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
-    let mut command = new_platform_pty_command(launch_kind.as_deref(), wsl_distro_name.as_deref());
+    let mut command = if let Some(launch_command) = launch_command {
+        new_direct_pty_command(launch_command)?
+    } else {
+        new_platform_pty_command(launch_kind.as_deref(), wsl_distro_name.as_deref())
+    };
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
 
@@ -188,6 +201,37 @@ pub fn pty_create_session(
     });
 
     Ok(())
+}
+
+fn new_direct_pty_command(launch_command: PtyLaunchCommand) -> Result<CommandBuilder, String> {
+    let executable = launch_command.executable.trim();
+    if executable.is_empty() {
+        return Err("PTY launch executable cannot be empty".to_string());
+    }
+
+    let mut command = CommandBuilder::new(executable);
+    for arg in launch_command.args {
+        command.arg(expand_home_path_arg(arg));
+    }
+    Ok(command)
+}
+
+fn expand_home_path_arg(arg: String) -> String {
+    let suffix = if arg == "~" {
+        Some("")
+    } else if let Some(rest) = arg.strip_prefix("~/") {
+        Some(rest)
+    } else if let Some(rest) = arg.strip_prefix("~\\") {
+        Some(rest)
+    } else {
+        None
+    };
+
+    match (suffix, dirs::home_dir()) {
+        (Some(""), Some(home_dir)) => home_dir.to_string_lossy().to_string(),
+        (Some(rest), Some(home_dir)) => home_dir.join(rest).to_string_lossy().to_string(),
+        _ => arg,
+    }
 }
 
 #[cfg(target_os = "windows")]

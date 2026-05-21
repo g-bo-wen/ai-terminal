@@ -102,6 +102,10 @@ export class ConnectionProbeLogicService {
     return this.truncateStatusMessage(summary, 220);
   }
 
+  extractConnectionFailureLine(output: string): string {
+    return this.extractProbeFailureLine(output);
+  }
+
   hasPasswordPrompt(output: string): boolean {
     const normalizedOutput = this.normalizeTerminalOutput(output);
     return /(?:password|passphrase|密码)[^\n\r]*[:：][\s\u0000-\u001f]*$/i.test(normalizedOutput);

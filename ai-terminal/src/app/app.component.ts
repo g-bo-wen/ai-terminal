@@ -27,7 +27,7 @@ import {
   CreateConnectionProfileInput,
   UpdateConnectionProfilePatch
 } from './models/connection-profile.model';
-import { TerminalSession } from './models/terminal-session.model';
+import { TerminalConnectionState, TerminalSession } from './models/terminal-session.model';
 import {
   TerminalProfileKind,
   TerminalProfileViewItem,
@@ -88,6 +88,7 @@ interface ActiveConnectionRuntime {
   profileType: ConnectionProfileType;
   profileSnapshot?: ConnectionProfile;
   passwordAttempted: boolean;
+  connected: boolean;
   pendingAutoInputRuleIds: string[];
   firedAutoInputRuleIds: string[];
   createdAt: string;
@@ -368,6 +369,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   async ngOnInit() {
     this.loadAiSettings();
+    await this.aiConversationService.loadRecentConversations();
     void this.loadAiLogFilePath();
     this.loadConnectionProfiles();
     void this.refreshProcessElevationStatus();
@@ -382,13 +384,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     );
 
     // Clean any existing code blocks to ensure no backticks are displayed
+    this.syncAiConversationState();
     this.sanitizeAllCodeBlocks();
     this.syncAiConversationState();
   }
 
   private async loadAiLogFilePath(): Promise<void> {
     try {
-      this.aiLogFilePath = await this.aiChatLogService.getLogFilePath();
+      this.aiLogFilePath = await this.aiChatLogService.getLogDirectoryPath();
     } catch (error) {
       console.error('Failed to resolve AI chat log file path:', error);
     }
@@ -458,6 +461,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     this.terminal.onResize(({ cols, rows }) => {
       if (!this.activeSessionId) {
+        return;
+      }
+      if (!this.isTerminalSessionWritable(this.activeSessionId)) {
         return;
       }
       invoke<void>('pty_resize', { sessionId: this.activeSessionId, cols, rows })
@@ -560,7 +566,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private writeToActivePty(data: string): void {
-    if (!this.activeSessionId || !data) {
+    if (!this.activeSessionId || !data || !this.isTerminalSessionWritable(this.activeSessionId)) {
       return;
     }
 
@@ -568,7 +574,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private async writeToPtySession(sessionId: string, data: string): Promise<void> {
-    if (!data) {
+    if (!data || !this.isTerminalSessionWritable(sessionId)) {
       return;
     }
 
@@ -640,6 +646,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       const previousRaw = this.ptyRawBufferBySession.get(payload.sessionId) || '';
       this.ptyRawBufferBySession.set(payload.sessionId, previousRaw + payload.data);
+      this.updateConnectionRuntimeFromOutput(payload.sessionId);
       this.logConnectionDisplayDebug('pty_output raw chunk', {
         sessionId: payload.sessionId,
         ...this.describeTerminalDataForDebug(payload.data)
@@ -708,12 +715,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     const unlistenPtyExit = await listen('pty_exit', (event) => {
       const payload = event.payload as { sessionId: string; success: boolean };
+      const rawOutput = this.ptyRawBufferBySession.get(payload.sessionId) || '';
+      this.handlePtySessionExit(payload.sessionId, payload.success, rawOutput);
       this.ptySessions.delete(payload.sessionId);
       this.pendingPtySessions.delete(payload.sessionId);
       this.ptySessionPromises.delete(payload.sessionId);
       this.pendingPtyInputBySession.delete(payload.sessionId);
       this.ptyInputFlushPromises.delete(payload.sessionId);
-      this.activeConnectionRuntimes.delete(payload.sessionId);
       this.ptyRawBufferBySession.delete(payload.sessionId);
       this.ptyDisplayEpochBySession.delete(payload.sessionId);
       this.hiddenConnectionInputEchoesBySession.delete(payload.sessionId);
@@ -726,8 +734,75 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.unlistenFunctions.push(unlistenPtyOutput, unlistenPtyExit);
   }
 
+  private updateConnectionRuntimeFromOutput(sessionId: string): void {
+    const runtime = this.activeConnectionRuntimes.get(sessionId);
+    if (!runtime || runtime.connected) {
+      return;
+    }
+
+    const session = this.terminalSessions.find((candidate) => candidate.id === sessionId);
+    if (!session) {
+      return;
+    }
+
+    const rawOutput = this.ptyRawBufferBySession.get(sessionId) || '';
+    const normalizedOutput = this.connectionProbeLogicService.normalizeTerminalOutput(rawOutput);
+    if (!normalizedOutput || this.connectionProbeLogicService.hasProbeConnectionFailure(normalizedOutput)) {
+      return;
+    }
+
+    if (!this.hasLikelyEstablishedConnectionOutput(sessionId, normalizedOutput)) {
+      return;
+    }
+
+    const profile = this.getConnectionRuntimeProfile(runtime);
+    if (!profile) {
+      return;
+    }
+
+    runtime.connected = true;
+    this.markSessionConnected(sessionId, profile);
+    this.connectionProfileService.markConnected(profile.id);
+    this.loadConnectionProfiles();
+    this.connectionStatus = `Connected ${this.generateConnectionDisplayName(profile)}.`;
+  }
+
+  private hasLikelyEstablishedConnectionOutput(sessionId: string, normalizedOutput: string): boolean {
+    const outputTail = this.getPtyOutputTail(sessionId);
+    if (this.connectionProbeLogicService.hasPasswordPrompt(outputTail)) {
+      return false;
+    }
+
+    return /(?:Welcome to |Last login:|JumpServer|主机IP|选择组|Documentation:)/i.test(normalizedOutput) ||
+      this.connectionProbeLogicService.hasLikelyShellPrompt(normalizedOutput);
+  }
+
+  private handlePtySessionExit(sessionId: string, success: boolean, rawOutput: string): void {
+    const session = this.terminalSessions.find((candidate) => candidate.id === sessionId);
+    if (!session?.connectionProfileId && !session?.launchCommand) {
+      return;
+    }
+
+    const runtime = this.activeConnectionRuntimes.get(sessionId);
+    const cleanOutput = this.connectionProbeLogicService.normalizeTerminalOutput(rawOutput);
+    const failureLine = this.connectionProbeLogicService.extractConnectionFailureLine(cleanOutput.slice(-4000));
+    const wasConnected = Boolean(runtime?.connected || session?.connectionState === 'connected');
+    const nextState: TerminalConnectionState = failureLine
+      ? (wasConnected ? 'disconnected' : 'failed')
+      : success
+        ? 'ended'
+        : (wasConnected ? 'disconnected' : 'failed');
+    const fallbackReason = success
+      ? 'Remote session ended.'
+      : wasConnected
+        ? 'Remote connection closed unexpectedly.'
+        : 'SSH process exited before the connection completed.';
+
+    this.markConnectionSessionTerminated(sessionId, nextState, failureLine || fallbackReason);
+  }
+
   private respondToTerminalStatusQueries(sessionId: string, data: string): void {
-    if (sessionId === this.activeSessionId || !data.includes('\x1b[6n')) {
+    if (sessionId === this.activeSessionId || !data.includes('\x1b[6n') || !this.isTerminalSessionWritable(sessionId)) {
       return;
     }
 
@@ -1113,6 +1188,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
+    const session = this.terminalSessions.find((candidate) => candidate.id === sessionId);
+    if (this.isTerminalSessionTerminated(session)) {
+      return;
+    }
+
     const pendingSession = this.ptySessionPromises.get(sessionId);
     if (pendingSession) {
       return pendingSession;
@@ -1120,7 +1200,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     const cols = this.terminal.cols || 80;
     const rows = this.terminal.rows || 24;
-    const session = this.terminalSessions.find((candidate) => candidate.id === sessionId);
     this.pendingPtySessions.add(sessionId);
 
     const createSession = (async () => {
@@ -1129,7 +1208,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         cols,
         rows,
         launchKind: session?.terminalKind,
-        wslDistroName: session?.wslDistroName
+        wslDistroName: session?.wslDistroName,
+        launchCommand: session?.launchCommand
       });
       this.ptySessions.add(sessionId);
       if (!this.ptyBufferBySession.has(sessionId)) {
@@ -1168,6 +1248,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       displayEpoch: this.ptyDisplayEpochBySession.get(sessionId) || 0
     });
     this.recreateInteractiveTerminalForReplay();
+    this.updateTerminalInputMode();
     if (!this.terminal) {
       this.isRenderingPtyBuffer = false;
       return;
@@ -1194,6 +1275,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const cols = this.terminal.cols || 80;
     const rows = this.terminal.rows || 24;
     if (!this.activeSessionId) {
+      return;
+    }
+    if (!this.isTerminalSessionWritable(this.activeSessionId)) {
       return;
     }
     invoke<void>('pty_resize', { sessionId: this.activeSessionId, cols, rows })
@@ -2171,7 +2255,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.syncAiConversationState();
       },
       getAiLogFilePath: async () => {
-        this.aiLogFilePath = await this.aiChatLogService.getLogFilePath();
+        this.aiLogFilePath = await this.aiChatLogService.getLogDirectoryPath();
         return this.aiLogFilePath;
       },
       testOpenAiConnection: () => {
@@ -2279,9 +2363,63 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   createNewAiConversation(): void {
+    if (!this.activeAiConversation) {
+      return;
+    }
+
     this.aiConversationService.clearActiveConversation();
     this.syncAiConversationState();
     this.shouldScroll = true;
+  }
+
+  deleteAiConversation(conversationId: string): void {
+    const conversation = this.aiConversationService.getConversation(conversationId);
+    if (!conversation) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete chat session "${conversation.title}"?`);
+    if (!confirmed) {
+      return;
+    }
+
+    this.clearRunningExecutionStatesForConversation(conversation);
+    this.clearCommandExplanationStatesForConversation(conversation);
+    this.aiConversationService.deleteConversation(conversationId);
+    this.syncAiConversationState();
+    this.shouldScroll = true;
+  }
+
+  deleteAiMessageTurn(conversationId: string, messageId: string): void {
+    const conversation = this.aiConversationService.getConversation(conversationId);
+    if (!conversation) {
+      return;
+    }
+
+    const message = conversation.messages.find((currentMessage) => currentMessage.id === messageId);
+    if (!message) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      message.role === 'system'
+        ? 'Delete this system message?'
+        : 'Delete this question and answer?'
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    const messageIdsToRemove = this.getAiMessageTurnIds(conversation, messageId);
+    this.clearRunningExecutionStatesForMessageIds(conversation, messageIdsToRemove);
+    this.clearCommandExplanationStatesForMessageIds(conversation, messageIdsToRemove);
+    this.aiConversationService.removeMessageTurn(conversationId, messageId);
+    this.syncAiConversationState();
+    this.shouldScroll = true;
+  }
+
+  getDeleteAiMessageTitle(message: AiMessage): string {
+    return message.role === 'system' ? 'Delete message' : 'Delete this question and answer';
   }
 
   switchAiConversation(conversationId: string): void {
@@ -2295,7 +2433,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   getConversationSessionName(conversation: AiConversation): string {
-    return this.terminalSessions.find((session) => session.id === conversation.terminalSessionId)?.name || 'No session';
+    return this.terminalSessions.find((session) => session.id === conversation.terminalSessionId)?.name || 'Saved chat';
   }
 
   getConversationMessageCount(conversation: AiConversation): number {
@@ -2308,6 +2446,104 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   trackByAiMessageId(_: number, message: AiMessage): string {
     return message.id;
+  }
+
+  private getAiMessageTurnIds(conversation: AiConversation, messageId: string): Set<string> {
+    const messageIndex = conversation.messages.findIndex((message) => message.id === messageId);
+    const messageIds = new Set<string>();
+    if (messageIndex === -1) {
+      return messageIds;
+    }
+
+    const targetMessage = conversation.messages[messageIndex];
+    if (targetMessage.role === 'user') {
+      messageIds.add(targetMessage.id);
+      const nextMessage = conversation.messages[messageIndex + 1];
+      if (nextMessage?.role === 'assistant') {
+        messageIds.add(nextMessage.id);
+      }
+    } else if (targetMessage.role === 'assistant') {
+      const previousMessage = conversation.messages[messageIndex - 1];
+      if (previousMessage?.role === 'user') {
+        messageIds.add(previousMessage.id);
+      }
+      messageIds.add(targetMessage.id);
+    } else {
+      messageIds.add(targetMessage.id);
+    }
+
+    return messageIds;
+  }
+
+  private clearRunningExecutionStatesForConversation(conversation: AiConversation): void {
+    const executionIds = new Set(conversation.executions.map((execution) => execution.id));
+    for (const [terminalSessionId, runningExecution] of this.runningExecutionStatesBySession.entries()) {
+      if (executionIds.has(runningExecution.executionId)) {
+        this.runningExecutionStatesBySession.delete(terminalSessionId);
+      }
+    }
+  }
+
+  private clearRunningExecutionStatesForMessageIds(
+    conversation: AiConversation,
+    messageIds: Set<string>
+  ): void {
+    const suggestionIds = this.getSuggestionIdsForMessageIds(conversation, messageIds);
+    const executionIds = new Set(
+      conversation.executions
+        .filter((execution) => execution.suggestionId && suggestionIds.has(execution.suggestionId))
+        .map((execution) => execution.id)
+    );
+
+    for (const [terminalSessionId, runningExecution] of this.runningExecutionStatesBySession.entries()) {
+      if (executionIds.has(runningExecution.executionId)) {
+        this.runningExecutionStatesBySession.delete(terminalSessionId);
+      }
+    }
+  }
+
+  private clearCommandExplanationStatesForConversation(conversation: AiConversation): void {
+    const suggestionIds = new Set(
+      conversation.messages
+        .flatMap((message) => message.suggestions || [])
+        .map((suggestion) => suggestion.id)
+    );
+    this.clearCommandExplanationStatesForSuggestionIds(suggestionIds);
+  }
+
+  private clearCommandExplanationStatesForMessageIds(
+    conversation: AiConversation,
+    messageIds: Set<string>
+  ): void {
+    this.clearCommandExplanationStatesForSuggestionIds(
+      this.getSuggestionIdsForMessageIds(conversation, messageIds)
+    );
+  }
+
+  private clearCommandExplanationStatesForSuggestionIds(suggestionIds: Set<string>): void {
+    if (suggestionIds.size === 0) {
+      return;
+    }
+
+    const nextStates = { ...this.commandExplanationStates };
+    for (const suggestionId of suggestionIds) {
+      this.commandExplanationAbortControllers.get(suggestionId)?.abort();
+      this.commandExplanationAbortControllers.delete(suggestionId);
+      delete nextStates[suggestionId];
+    }
+    this.commandExplanationStates = nextStates;
+  }
+
+  private getSuggestionIdsForMessageIds(
+    conversation: AiConversation,
+    messageIds: Set<string>
+  ): Set<string> {
+    return new Set(
+      conversation.messages
+        .filter((message) => messageIds.has(message.id))
+        .flatMap((message) => message.suggestions || [])
+        .map((suggestion) => suggestion.id)
+    );
   }
 
   // Compatibility path for connection-test messages that still arrive as ChatHistory entries.
@@ -2507,6 +2743,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   getTerminalSessionKindLabel(session: TerminalSession): string {
+    if (session.connectionState === 'connecting') {
+      return 'Connecting';
+    }
+
+    if (session.connectionState === 'failed') {
+      return 'Failed';
+    }
+
+    if (session.connectionState === 'disconnected') {
+      return 'Disconnected';
+    }
+
+    if (session.connectionState === 'ended') {
+      return 'Ended';
+    }
+
     if (session.connectionProfileId) {
       return session.terminalKind === 'jumpserver' ? 'JumpServer' : 'SSH';
     }
@@ -2520,6 +2772,44 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     return 'PowerShell';
+  }
+
+  getActiveTerminalSessionNotice(): string {
+    const session = this.terminalSessions.find((candidate) => candidate.id === this.activeSessionId);
+    if (!session) {
+      return '';
+    }
+
+    if (session.connectionState === 'connecting') {
+      return `Connecting ${session.name}...`;
+    }
+
+    if (session.connectionState === 'failed') {
+      return `Connection failed: ${session.connectionEndReason || 'SSH could not connect.'}`;
+    }
+
+    if (session.connectionState === 'disconnected') {
+      return `Connection disconnected: ${session.connectionEndReason || 'Remote connection closed.'}`;
+    }
+
+    if (session.connectionState === 'ended') {
+      return session.connectionEndReason || 'Remote session ended.';
+    }
+
+    return '';
+  }
+
+  getActiveTerminalSessionNoticeClass(): string {
+    const session = this.terminalSessions.find((candidate) => candidate.id === this.activeSessionId);
+    if (session?.connectionState === 'failed') {
+      return 'terminal-session-notice terminal-session-notice-error';
+    }
+
+    if (session?.connectionState === 'disconnected') {
+      return 'terminal-session-notice terminal-session-notice-warning';
+    }
+
+    return 'terminal-session-notice';
   }
 
   private loadWslDistributions(forceRefresh = false): Promise<void> {
@@ -3094,29 +3384,29 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     let sessionId = '';
 
     try {
-      const sshCommand = this.buildSshCommand(profile);
-      sessionId = this.createNewSession(
+      const launchCommand = this.connectionCommandService.buildSshLaunchCommand(profile);
+      const createdSession = this.terminalSessionService.createNewSession(
+        this.terminalSessions,
         displayName,
-        true,
+        false,
         profile.id,
-        profile.type === 'jumpserver' ? 'jumpserver' : 'ssh'
+        profile.type === 'jumpserver' ? 'jumpserver' : 'ssh',
+        undefined,
+        launchCommand,
+        'connecting'
       );
+      this.terminalSessions = createdSession.sessions;
+      sessionId = createdSession.sessionId;
       this.registerActiveConnectionRuntime(sessionId, profile);
+      this.switchToSession(sessionId);
       await this.ensurePtySession(sessionId);
-      await invoke<void>('pty_write', {
-        sessionId,
-        data: this.withTerminalSubmitSequence(sshCommand)
-      });
-      this.markSessionConnected(sessionId, profile);
-      this.connectionProfileService.markConnected(profile.id);
-      this.loadConnectionProfiles();
       this.connectionStatus = `Connecting ${displayName}.`;
       this.isConnectionManagerOpen = false;
       this.isConnectionFormOpen = false;
     } catch (error: any) {
       this.connectionStatus = `Failed to connect ${displayName}: ${error.message || error}`;
       if (sessionId) {
-        this.activeConnectionRuntimes.delete(sessionId);
+        this.markConnectionSessionTerminated(sessionId, 'failed', error.message || String(error || 'Failed to start SSH.'));
       }
       if (sessionId) {
         console.error(`Failed to connect profile ${profile.id} in session ${sessionId}:`, error);
@@ -3133,6 +3423,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       profileType: profile.type,
       profileSnapshot: { ...profile, autoInputRules: profile.autoInputRules.map((rule) => ({ ...rule })) },
       passwordAttempted: false,
+      connected: false,
       pendingAutoInputRuleIds: [],
       firedAutoInputRuleIds: [],
       createdAt: new Date().toISOString()
@@ -3216,6 +3507,53 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private getPtyOutputTail(sessionId: string): string {
     const output = this.ptyRawBufferBySession.get(sessionId) || '';
     return output.slice(-4000);
+  }
+
+  private markConnectionSessionTerminated(
+    sessionId: string,
+    state: Extract<TerminalConnectionState, 'failed' | 'disconnected' | 'ended'>,
+    reason: string
+  ): void {
+    const endedAt = new Date().toISOString();
+    const cleanReason = this.connectionProbeLogicService.normalizeTerminalOutput(reason).trim() || 'Connection ended.';
+    this.activeConnectionRuntimes.delete(sessionId);
+    this.terminalSessions = this.terminalSessions.map((session) =>
+      session.id === sessionId
+        ? {
+            ...session,
+            isSshSessionActive: false,
+            currentSshUserHost: null,
+            connectionState: state,
+            connectionEndReason: cleanReason,
+            connectionEndedAt: endedAt
+          }
+        : session
+    );
+
+    if (this.activeSessionId === sessionId) {
+      this.isSshSessionActive = false;
+      this.currentSshUserHost = null;
+      this.updateTerminalInputMode();
+    }
+  }
+
+  private isTerminalSessionWritable(sessionId: string): boolean {
+    const session = this.terminalSessions.find((candidate) => candidate.id === sessionId);
+    return !this.isTerminalSessionTerminated(session);
+  }
+
+  private isTerminalSessionTerminated(session?: TerminalSession): boolean {
+    return session?.connectionState === 'failed' ||
+      session?.connectionState === 'disconnected' ||
+      session?.connectionState === 'ended';
+  }
+
+  private updateTerminalInputMode(): void {
+    if (!this.terminal) {
+      return;
+    }
+
+    this.terminal.options.disableStdin = !this.isTerminalSessionWritable(this.activeSessionId);
   }
 
   buildSshCommand(profile: ConnectionProfile): string {
@@ -3420,7 +3758,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
             ...session,
             connectionProfileId: profile.id,
             isSshSessionActive: true,
-            currentSshUserHost: userHost
+            currentSshUserHost: userHost,
+            connectionState: 'connected',
+            connectionEndReason: undefined,
+            connectionEndedAt: undefined
           }
         : session
     );
@@ -3428,6 +3769,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (this.activeSessionId === sessionId) {
       this.isSshSessionActive = true;
       this.currentSshUserHost = userHost;
+      this.updateTerminalInputMode();
     }
   }
 
@@ -3669,6 +4011,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   // Method to copy code to terminal input (adds to prompt for editing, does not execute)
   sendCodeToTerminal(code: string): void {
     const command = this.transformCodeForDisplay(code);
+    if (this.activeSessionId && !this.isTerminalSessionWritable(this.activeSessionId)) {
+      this.showCopiedNotification('Terminal session ended');
+      return;
+    }
+
     if (this.activeSessionId) {
       this.writeToPtySession(this.activeSessionId, command).catch((error) => {
         console.error('Failed to send command to PTY:', error);
@@ -3680,6 +4027,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   sendSuggestionToTerminal(suggestion: CommandSuggestion): void {
+    if (this.activeSessionId && !this.isTerminalSessionWritable(this.activeSessionId)) {
+      this.showCopiedNotification('Terminal session ended');
+      return;
+    }
+
     if (this.activeSessionId) {
       this.writeToPtySession(this.activeSessionId, suggestion.command).catch((error) => {
         console.error('Failed to send command to PTY:', error);
@@ -3758,6 +4110,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   ): Promise<void> {
     const command = options.suggestion ? code.trim() : this.transformCodeForDisplay(code);
     const activeSessionId = this.activeSessionId;
+    if (activeSessionId && !this.isTerminalSessionWritable(activeSessionId)) {
+      console.warn('Cannot execute command because the terminal session has ended.');
+      return;
+    }
+
     if (
       this.executionResultFeatureEnabled &&
       activeSessionId &&
@@ -3993,9 +4350,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     // Restore session state
     this.restoreSessionState(targetSession);
     if (this.terminal) {
+      this.updateTerminalInputMode();
+      if (this.isTerminalSessionTerminated(targetSession)) {
+        this.renderActivePtyBuffer();
+        this.resizeInteractiveTerminal();
+        this.focusTerminalInput();
+        return;
+      }
+
       void this.ensurePtySession(sessionId).then(() => {
         this.renderActivePtyBuffer();
         this.resizeInteractiveTerminal();
+        this.updateTerminalInputMode();
         this.focusTerminalInput();
       }).catch((error) => {
         console.error(`Failed to initialize PTY for ${sessionId}:`, error);

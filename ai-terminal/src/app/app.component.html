@@ -68,6 +68,12 @@
 
       <div class="output-area terminal-output-area">
         <div class="xterm-wrapper" #terminalContainer (mousedown)="focusTerminalInput()"></div>
+        <div
+          *ngIf="getActiveTerminalSessionNotice() as terminalSessionNotice"
+          [class]="getActiveTerminalSessionNoticeClass()"
+        >
+          {{ terminalSessionNotice }}
+        </div>
       </div>
     </div>
   </div>
@@ -112,21 +118,32 @@
             class="conversation-card"
             *ngFor="let conversation of aiConversations; trackBy: trackByAiConversationId"
             [class.active]="conversation.id === activeAiConversationId"
+            (click)="continueAiConversation(conversation.id)"
           >
-            <div class="conversation-card-header" (click)="continueAiConversation(conversation.id)">
+            <div class="conversation-card-header">
               <div class="conversation-card-main">
                 <div class="conversation-title">{{ conversation.title }}</div>
                 <div class="conversation-meta">
                   {{ getConversationSessionName(conversation) }} · {{ getConversationMessageCount(conversation) }} messages
                 </div>
               </div>
-              <button
-                class="conversation-select-button"
-                type="button"
-                (click)="continueAiConversation(conversation.id); $event.stopPropagation()"
-              >
-                {{ conversation.id === activeAiConversationId ? 'Selected' : 'Continue' }}
-              </button>
+              <div class="conversation-card-actions">
+                <button
+                  class="conversation-select-button"
+                  type="button"
+                  (click)="continueAiConversation(conversation.id); $event.stopPropagation()"
+                >
+                  {{ conversation.id === activeAiConversationId ? 'Selected' : 'Continue' }}
+                </button>
+                <button
+                  class="conversation-delete-button"
+                  type="button"
+                  title="Delete chat session"
+                  (click)="deleteAiConversation(conversation.id); $event.stopPropagation()"
+                >
+                  Delete
+                </button>
+              </div>
             </div>
 
             <div
@@ -135,11 +152,19 @@
               [class.chat-entry-user]="message.role === 'user'"
               [class.chat-entry-ai]="message.role === 'assistant'"
               [class.chat-entry-system]="message.role === 'system'"
-              (mousedown)="$event.stopPropagation()"
-              (click)="$event.stopPropagation()"
             >
+              <div class="chat-entry-toolbar">
+                <span class="chat-message-label">{{ getAiMessageLabel(message) }}</span>
+                <button
+                  class="chat-delete-button"
+                  type="button"
+                  [title]="getDeleteAiMessageTitle(message)"
+                  (click)="deleteAiMessageTurn(conversation.id, message.id); $event.stopPropagation()"
+                >
+                  Delete
+                </button>
+              </div>
               <div class="chat-output">
-                <span class="chat-message-label">{{ getAiMessageLabel(message) }}:</span>
                 <ng-container *ngIf="message.role === 'assistant'; else plainMessage">
                   <ng-container *ngFor="let segment of getMessageDisplaySegments(message); trackBy: trackByResponseSegment">
                     <ng-container *ngIf="isCodeBlockPlaceholder(segment)">
@@ -300,7 +325,12 @@
       </div>
 
       <div class="conversation-strip" *ngIf="activeAiView === 'chat'">
-        <button class="new-conversation-button" type="button" (click)="createNewAiConversation()">
+        <button
+          class="new-conversation-button"
+          type="button"
+          [disabled]="!activeAiConversation"
+          (click)="createNewAiConversation()"
+        >
           New Chat
         </button>
         <div class="conversation-mode-label" *ngIf="activeAiConversation; else newConversationMode">
@@ -349,7 +379,7 @@
         </div>
 
         <div class="settings-section" *ngIf="aiLogFilePath">
-          <label class="settings-label">AI Chat Log</label>
+          <label class="settings-label">AI Chat Logs</label>
           <div class="settings-status">{{ aiLogFilePath }}</div>
         </div>
 

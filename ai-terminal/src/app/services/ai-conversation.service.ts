@@ -1,4 +1,5 @@
 import { Injectable } from '@angular/core';
+import { invoke } from '@tauri-apps/api/core';
 import { AiCodeBlock, AiConversation, AiMessage } from '../models/ai-conversation.model';
 import { CommandExecution, CommandExecutionStatus } from '../models/command-execution.model';
 import { CommandSuggestion } from '../models/command-suggestion.model';
@@ -33,14 +34,35 @@ export interface CreateCommandExecutionInput {
   providedIn: 'root'
 })
 export class AiConversationService {
+  private readonly recentConversationLimit = 10;
   private readonly executionContextMaxChars = 8000;
   private readonly executionContextSingleOutputMaxChars = 3000;
   private conversations: AiConversation[] = [];
   private activeConversationId = '';
   private runningExecutionIdsByTerminalSession = new Map<string, string>();
+  private persistQueuesByConversationId = new Map<string, Promise<void>>();
+  private deletedConversationIds = new Set<string>();
+
+  async loadRecentConversations(limit: number = this.recentConversationLimit): Promise<void> {
+    try {
+      const conversations = await invoke<unknown[]>('list_ai_conversations', { limit });
+      this.conversations = conversations
+        .map((conversation) => this.normalizeConversation(conversation))
+        .filter((conversation): conversation is AiConversation => Boolean(conversation))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .slice(0, limit);
+      this.activeConversationId = '';
+      this.runningExecutionIdsByTerminalSession.clear();
+    } catch (error) {
+      console.error('Failed to load AI conversations:', error);
+    }
+  }
 
   listConversations(): AiConversation[] {
-    return this.conversations.filter((conversation) => conversation.status === 'active');
+    return this.conversations
+      .filter((conversation) => conversation.status === 'active')
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, this.recentConversationLimit);
   }
 
   getActiveConversationId(): string {
@@ -70,6 +92,7 @@ export class AiConversationService {
 
     this.conversations = [...this.conversations, conversation];
     this.activeConversationId = conversation.id;
+    this.schedulePersistConversation(conversation.id);
     return conversation;
   }
 
@@ -131,6 +154,7 @@ export class AiConversationService {
       };
     });
 
+    this.schedulePersistConversation(conversationId);
     return message;
   }
 
@@ -173,6 +197,10 @@ export class AiConversationService {
       };
     });
 
+    if (updatedMessage) {
+      this.schedulePersistConversation(conversationId);
+    }
+
     return updatedMessage;
   }
 
@@ -208,6 +236,7 @@ export class AiConversationService {
         : currentConversation
     );
 
+    this.schedulePersistConversation(input.conversationId);
     return execution;
   }
 
@@ -273,6 +302,7 @@ export class AiConversationService {
     patch: Partial<CommandExecution>
   ): CommandExecution | undefined {
     let updatedExecution: CommandExecution | undefined;
+    let updatedConversationId = '';
     const updatedAt = new Date().toISOString();
 
     this.conversations = this.conversations.map((conversation) => {
@@ -287,6 +317,7 @@ export class AiConversationService {
           ...execution,
           ...patch
         };
+        updatedConversationId = conversation.id;
         return updatedExecution;
       });
 
@@ -299,11 +330,16 @@ export class AiConversationService {
         : conversation;
     });
 
+    if (updatedConversationId) {
+      this.schedulePersistConversation(updatedConversationId);
+    }
+
     return updatedExecution;
   }
 
   removeCommandExecution(executionId: string): boolean {
     let didRemoveExecution = false;
+    const updatedConversationIds: string[] = [];
     const updatedAt = new Date().toISOString();
 
     this.conversations = this.conversations.map((conversation) => {
@@ -313,6 +349,7 @@ export class AiConversationService {
       }
 
       didRemoveExecution = true;
+      updatedConversationIds.push(conversation.id);
       return {
         ...conversation,
         executions,
@@ -322,6 +359,7 @@ export class AiConversationService {
 
     if (didRemoveExecution) {
       this.removeRunningExecutionReference(executionId);
+      updatedConversationIds.forEach((conversationId) => this.schedulePersistConversation(conversationId));
     }
 
     return didRemoveExecution;
@@ -427,22 +465,92 @@ export class AiConversationService {
       return;
     }
 
-    const executionIdsToRemove = new Set(activeConversation.executions.map((execution) => execution.id));
+    this.deleteConversation(activeConversation.id);
+  }
+
+  deleteConversation(conversationId: string): boolean {
+    const conversation = this.getConversation(conversationId);
+    if (!conversation) {
+      return false;
+    }
+
+    for (const execution of conversation.executions) {
+      this.removeRunningExecutionReference(execution.id);
+    }
+
+    this.conversations = this.conversations.filter((currentConversation) => currentConversation.id !== conversationId);
+    if (this.activeConversationId === conversationId) {
+      this.activeConversationId = '';
+    }
+    this.scheduleDeletePersistedConversation(conversationId);
+    return true;
+  }
+
+  removeMessageTurn(conversationId: string, messageId: string): boolean {
+    const conversation = this.getConversation(conversationId);
+    if (!conversation) {
+      return false;
+    }
+
+    const messageIndex = conversation.messages.findIndex((message) => message.id === messageId);
+    if (messageIndex === -1) {
+      return false;
+    }
+
+    const messageIdsToRemove = new Set<string>();
+    const targetMessage = conversation.messages[messageIndex];
+    if (targetMessage.role === 'user') {
+      messageIdsToRemove.add(targetMessage.id);
+      const nextMessage = conversation.messages[messageIndex + 1];
+      if (nextMessage?.role === 'assistant') {
+        messageIdsToRemove.add(nextMessage.id);
+      }
+    } else if (targetMessage.role === 'assistant') {
+      const previousMessage = conversation.messages[messageIndex - 1];
+      if (previousMessage?.role === 'user') {
+        messageIdsToRemove.add(previousMessage.id);
+      }
+      messageIdsToRemove.add(targetMessage.id);
+    } else {
+      messageIdsToRemove.add(targetMessage.id);
+    }
+
+    const suggestionIdsToRemove = new Set(
+      conversation.messages
+        .filter((message) => messageIdsToRemove.has(message.id))
+        .flatMap((message) => message.suggestions || [])
+        .map((suggestion) => suggestion.id)
+    );
+    const executionIdsToRemove = new Set(
+      conversation.executions
+        .filter((execution) => execution.suggestionId && suggestionIdsToRemove.has(execution.suggestionId))
+        .map((execution) => execution.id)
+    );
+
     for (const executionId of executionIdsToRemove) {
       this.removeRunningExecutionReference(executionId);
     }
 
+    const nextMessages = conversation.messages.filter((message) => !messageIdsToRemove.has(message.id));
+    if (nextMessages.length === 0) {
+      return this.deleteConversation(conversationId);
+    }
+
     const updatedAt = new Date().toISOString();
-    this.conversations = this.conversations.map((conversation) =>
-      conversation.id === activeConversation.id
+    const nextExecutions = conversation.executions.filter((execution) => !executionIdsToRemove.has(execution.id));
+    this.conversations = this.conversations.map((currentConversation) =>
+      currentConversation.id === conversationId
         ? {
-            ...conversation,
-            messages: [],
-            executions: [],
+            ...currentConversation,
+            title: this.getTitleAfterMessageDeletion(currentConversation.title, nextMessages),
+            messages: nextMessages,
+            executions: nextExecutions,
             updatedAt
           }
-        : conversation
+        : currentConversation
     );
+    this.schedulePersistConversation(conversationId);
+    return true;
   }
 
   private updateCommandExecutionStatus(
@@ -451,6 +559,7 @@ export class AiConversationService {
     patch: Partial<CommandExecution> = {}
   ): CommandExecution | undefined {
     let updatedExecution: CommandExecution | undefined;
+    let updatedConversationId = '';
     const updatedAt = new Date().toISOString();
 
     this.conversations = this.conversations.map((conversation) => {
@@ -466,6 +575,7 @@ export class AiConversationService {
           ...patch,
           status
         };
+        updatedConversationId = conversation.id;
         return updatedExecution;
       });
 
@@ -477,6 +587,10 @@ export class AiConversationService {
           }
         : conversation;
     });
+
+    if (updatedConversationId) {
+      this.schedulePersistConversation(updatedConversationId);
+    }
 
     return updatedExecution;
   }
@@ -526,5 +640,160 @@ export class AiConversationService {
 
   private createClientId(prefix: string): string {
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  private getTitleAfterMessageDeletion(currentTitle: string, messages: AiMessage[]): string {
+    const firstUserMessage = messages.find((message) => message.role === 'user' && message.content.trim());
+    if (!firstUserMessage) {
+      return currentTitle;
+    }
+
+    const trimmedContent = firstUserMessage.content.trim();
+    return trimmedContent.length > 42
+      ? `${trimmedContent.slice(0, 39)}...`
+      : trimmedContent;
+  }
+
+  private schedulePersistConversation(conversationId: string): void {
+    if (this.deletedConversationIds.has(conversationId)) {
+      return;
+    }
+
+    const previousPersist = this.persistQueuesByConversationId.get(conversationId) || Promise.resolve();
+    const nextPersist = previousPersist
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.deletedConversationIds.has(conversationId)) {
+          return;
+        }
+
+        const conversation = this.getConversation(conversationId);
+        if (!conversation) {
+          return;
+        }
+
+        await invoke<string>('save_ai_conversation', { conversation });
+      })
+      .catch((error) => {
+        console.error(`Failed to save AI conversation ${conversationId}:`, error);
+      });
+
+    this.persistQueuesByConversationId.set(conversationId, nextPersist);
+    void nextPersist.finally(() => {
+      if (this.persistQueuesByConversationId.get(conversationId) === nextPersist) {
+        this.persistQueuesByConversationId.delete(conversationId);
+      }
+    });
+  }
+
+  private scheduleDeletePersistedConversation(conversationId: string): void {
+    this.deletedConversationIds.add(conversationId);
+    const previousPersist = this.persistQueuesByConversationId.get(conversationId) || Promise.resolve();
+    const deletePersist = previousPersist
+      .catch(() => undefined)
+      .then(() => invoke<void>('delete_ai_conversation', { conversationId }))
+      .catch((error) => {
+        console.error(`Failed to delete AI conversation ${conversationId}:`, error);
+      });
+
+    this.persistQueuesByConversationId.set(conversationId, deletePersist);
+    void deletePersist.finally(() => {
+      if (this.persistQueuesByConversationId.get(conversationId) === deletePersist) {
+        this.persistQueuesByConversationId.delete(conversationId);
+      }
+      this.deletedConversationIds.delete(conversationId);
+    });
+  }
+
+  private normalizeConversation(value: unknown): AiConversation | undefined {
+    const rawConversation = value as Partial<AiConversation> | null | undefined;
+    if (!rawConversation || typeof rawConversation.id !== 'string') {
+      return undefined;
+    }
+
+    const messages = Array.isArray(rawConversation.messages)
+      ? rawConversation.messages.map((message) => this.normalizeMessage(message)).filter((message): message is AiMessage => Boolean(message))
+      : [];
+    const executions = Array.isArray(rawConversation.executions)
+      ? rawConversation.executions
+          .map((execution) => this.normalizeCommandExecution(execution, rawConversation.id!))
+          .filter((execution): execution is CommandExecution => Boolean(execution))
+      : [];
+    const now = new Date().toISOString();
+
+    return {
+      id: rawConversation.id,
+      title: typeof rawConversation.title === 'string' && rawConversation.title.trim()
+        ? rawConversation.title
+        : 'Restored chat',
+      terminalSessionId: typeof rawConversation.terminalSessionId === 'string' && rawConversation.terminalSessionId.trim()
+        ? rawConversation.terminalSessionId
+        : 'restored-terminal-session',
+      status: rawConversation.status === 'archived' ? 'archived' : 'active',
+      messages,
+      executions,
+      createdAt: typeof rawConversation.createdAt === 'string' ? rawConversation.createdAt : now,
+      updatedAt: typeof rawConversation.updatedAt === 'string' ? rawConversation.updatedAt : now
+    };
+  }
+
+  private normalizeMessage(value: unknown): AiMessage | undefined {
+    const rawMessage = value as Partial<AiMessage> | null | undefined;
+    if (!rawMessage || typeof rawMessage.id !== 'string') {
+      return undefined;
+    }
+
+    const role = rawMessage.role === 'assistant' || rawMessage.role === 'system'
+      ? rawMessage.role
+      : 'user';
+
+    return {
+      id: rawMessage.id,
+      role,
+      content: typeof rawMessage.content === 'string' ? rawMessage.content : '',
+      rawContent: typeof rawMessage.rawContent === 'string' ? rawMessage.rawContent : undefined,
+      createdAt: typeof rawMessage.createdAt === 'string' ? rawMessage.createdAt : new Date().toISOString(),
+      codeBlocks: Array.isArray(rawMessage.codeBlocks) ? rawMessage.codeBlocks : undefined,
+      suggestions: Array.isArray(rawMessage.suggestions) ? rawMessage.suggestions : undefined,
+      isCommand: Boolean(rawMessage.isCommand),
+      referencedExecutionIds: Array.isArray(rawMessage.referencedExecutionIds) ? rawMessage.referencedExecutionIds : undefined
+    };
+  }
+
+  private normalizeCommandExecution(value: unknown, conversationId: string): CommandExecution | undefined {
+    const rawExecution = value as Partial<CommandExecution> | null | undefined;
+    if (!rawExecution || typeof rawExecution.id !== 'string' || typeof rawExecution.command !== 'string') {
+      return undefined;
+    }
+
+    const status = this.isCommandExecutionStatus(rawExecution.status) ? rawExecution.status : 'success';
+    const contextMode = rawExecution.contextMode === 'summary' || rawExecution.contextMode === 'selected' || rawExecution.contextMode === 'full'
+      ? rawExecution.contextMode
+      : 'none';
+    const now = new Date().toISOString();
+
+    return {
+      id: rawExecution.id,
+      conversationId: typeof rawExecution.conversationId === 'string' ? rawExecution.conversationId : conversationId,
+      suggestionId: typeof rawExecution.suggestionId === 'string' ? rawExecution.suggestionId : undefined,
+      terminalSessionId: typeof rawExecution.terminalSessionId === 'string' ? rawExecution.terminalSessionId : 'restored-terminal-session',
+      command: rawExecution.command,
+      status,
+      exitCode: typeof rawExecution.exitCode === 'number' ? rawExecution.exitCode : undefined,
+      rawOutput: typeof rawExecution.rawOutput === 'string' ? rawExecution.rawOutput : '',
+      editableOutput: typeof rawExecution.editableOutput === 'string' ? rawExecution.editableOutput : undefined,
+      outputPreview: typeof rawExecution.outputPreview === 'string' ? rawExecution.outputPreview : '',
+      outputSummary: typeof rawExecution.outputSummary === 'string' ? rawExecution.outputSummary : undefined,
+      includedInContext: Boolean(rawExecution.includedInContext),
+      contextMode,
+      selectedOutput: typeof rawExecution.selectedOutput === 'string' ? rawExecution.selectedOutput : undefined,
+      collapsed: rawExecution.collapsed !== false,
+      startedAt: typeof rawExecution.startedAt === 'string' ? rawExecution.startedAt : now,
+      finishedAt: typeof rawExecution.finishedAt === 'string' ? rawExecution.finishedAt : undefined
+    };
+  }
+
+  private isCommandExecutionStatus(value: unknown): value is CommandExecutionStatus {
+    return value === 'pending' || value === 'running' || value === 'success' || value === 'failed' || value === 'cancelled';
   }
 }

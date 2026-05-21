@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core';
 import { ConnectionProfile } from '../models/connection-profile.model';
+import { TerminalLaunchCommand } from '../models/terminal-session.model';
 
 @Injectable({
   providedIn: 'root'
@@ -13,6 +14,14 @@ export class ConnectionCommandService {
     return this.buildTargetSshCommand(profile, operatingSystem);
   }
 
+  buildSshLaunchCommand(profile: ConnectionProfile): TerminalLaunchCommand {
+    const parts = profile.type === 'jumpserver'
+      ? this.buildJumpServerSshCommandParts(profile)
+      : this.buildTargetSshCommandParts(profile);
+    const [executable, ...args] = parts;
+    return { executable, args };
+  }
+
   buildDirectProbeSshCommand(profile: ConnectionProfile, operatingSystem: string): string {
     const host = profile.targetHost?.trim();
     if (!host) {
@@ -21,7 +30,7 @@ export class ConnectionCommandService {
 
     const commandParts = [...this.createBaseSshCommandParts(), '-T'];
     if (profile.authMethod === 'privateKey' && profile.privateKeyPath?.trim()) {
-      commandParts.push('-i', this.quoteShellArg(profile.privateKeyPath.trim(), operatingSystem));
+      commandParts.push('-i', profile.privateKeyPath.trim());
     }
 
     if (profile.targetPort) {
@@ -30,7 +39,7 @@ export class ConnectionCommandService {
 
     const user = profile.targetUser?.trim();
     commandParts.push(user ? `${user}@${host}` : host, 'sh', '-s');
-    return commandParts.join(' ');
+    return this.joinShellCommand(commandParts, operatingSystem);
   }
 
   getSshUserHost(profile: ConnectionProfile): string {
@@ -40,6 +49,10 @@ export class ConnectionCommandService {
   }
 
   private buildTargetSshCommand(profile: ConnectionProfile, operatingSystem: string): string {
+    return this.joinShellCommand(this.buildTargetSshCommandParts(profile), operatingSystem);
+  }
+
+  private buildTargetSshCommandParts(profile: ConnectionProfile): string[] {
     const host = profile.targetHost?.trim();
     if (!host) {
       throw new Error('Target host is required for SSH connections.');
@@ -47,7 +60,7 @@ export class ConnectionCommandService {
 
     const commandParts = this.createBaseSshCommandParts();
     if (profile.authMethod === 'privateKey' && profile.privateKeyPath?.trim()) {
-      commandParts.push('-i', this.quoteShellArg(profile.privateKeyPath.trim(), operatingSystem));
+      commandParts.push('-i', profile.privateKeyPath.trim());
     }
 
     if (profile.targetPort) {
@@ -56,10 +69,14 @@ export class ConnectionCommandService {
 
     const user = profile.targetUser?.trim();
     commandParts.push(user ? `${user}@${host}` : host);
-    return commandParts.join(' ');
+    return commandParts;
   }
 
   private buildJumpServerSshCommand(profile: ConnectionProfile, operatingSystem: string): string {
+    return this.joinShellCommand(this.buildJumpServerSshCommandParts(profile), operatingSystem);
+  }
+
+  private buildJumpServerSshCommandParts(profile: ConnectionProfile): string[] {
     const host = profile.jumpHost?.trim();
     if (!host) {
       throw new Error('JumpServer host is required for JumpServer connections.');
@@ -67,7 +84,7 @@ export class ConnectionCommandService {
 
     const commandParts = this.createBaseSshCommandParts();
     if (profile.authMethod === 'privateKey' && profile.privateKeyPath?.trim()) {
-      commandParts.push('-i', this.quoteShellArg(profile.privateKeyPath.trim(), operatingSystem));
+      commandParts.push('-i', profile.privateKeyPath.trim());
     }
 
     if (profile.jumpPort) {
@@ -76,11 +93,15 @@ export class ConnectionCommandService {
 
     const user = profile.jumpUser?.trim();
     commandParts.push(user ? `${user}@${host}` : host);
-    return commandParts.join(' ');
+    return commandParts;
   }
 
   private createBaseSshCommandParts(): string[] {
     return ['ssh', '-o', 'StrictHostKeyChecking=accept-new'];
+  }
+
+  private joinShellCommand(parts: string[], operatingSystem: string): string {
+    return parts.map((part) => this.quoteShellArg(part, operatingSystem)).join(' ');
   }
 
   private quoteShellArg(value: string, operatingSystem: string): string {

@@ -1,6 +1,13 @@
 import { CommandHistory } from './command-history.model';
 import { TerminalProfileKind } from './terminal-profile.model';
 
+export interface TerminalLaunchCommand {
+  executable: string;
+  args: string[];
+}
+
+export type TerminalConnectionState = 'ready' | 'connecting' | 'connected' | 'failed' | 'disconnected' | 'ended';
+
 export interface TerminalSession {
   id: string;
   name: string;
@@ -13,4 +20,8 @@ export interface TerminalSession {
   connectionProfileId?: string;
   terminalKind?: TerminalProfileKind;
   wslDistroName?: string;
+  launchCommand?: TerminalLaunchCommand;
+  connectionState?: TerminalConnectionState;
+  connectionEndReason?: string;
+  connectionEndedAt?: string;
 }

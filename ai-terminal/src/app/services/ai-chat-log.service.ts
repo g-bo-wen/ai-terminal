@@ -20,6 +20,7 @@ export interface AiChatLogEvent {
 })
 export class AiChatLogService {
   private logFilePathPromise?: Promise<string>;
+  private logDirectoryPathPromise?: Promise<string>;
 
   createRequestId(operation: string): string {
     return `${operation}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -40,6 +41,14 @@ export class AiChatLogService {
     }
 
     return this.logFilePathPromise;
+  }
+
+  async getLogDirectoryPath(): Promise<string> {
+    if (!this.logDirectoryPathPromise) {
+      this.logDirectoryPathPromise = invoke<string>('get_ai_log_directory_path');
+    }
+
+    return this.logDirectoryPathPromise;
   }
 
   redactHeaders(headers: Record<string, string>): Record<string, string> {
